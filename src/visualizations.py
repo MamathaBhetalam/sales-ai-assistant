@@ -274,7 +274,7 @@ def waterfall_chart(df: pd.DataFrame, kpis: dict):
     """Revenue → Gross Profit waterfall showing discount drain."""
     rev = df["Sales"].sum()
     prf = df["Profit"].sum()
-    disc_loss = df["Sales"].sum() * df["Discount"].mean()
+    disc_loss = (df["Sales"] * df["Discount"]).sum()
     cost = rev - disc_loss - prf
 
     labels = ["Gross Revenue", "Discount Impact", "Operating Costs", "Net Profit"]
@@ -335,7 +335,7 @@ def margin_chart(df: pd.DataFrame, kpis: dict):
 
 
 def comparison_chart(df: pd.DataFrame, kpis: dict):
-    """YoY comparison: 2022 vs 2023 vs 2024 per quarter."""
+    """YoY comparison: last 3 years in the dataset per quarter."""
     qtr = kpis["quarterly"]
     years = sorted(qtr["Year"].unique())[-3:]  # last 3 years
 
@@ -472,7 +472,7 @@ def metric_tree_chart(df: pd.DataFrame, kpis: dict):
             layer="above",
         ))
 
-    def lbl(cx, cy, txt, sz=9):
+    def lbl(cx: float, cy: float, txt: str, sz: float = 9) -> None:
         annots.append(dict(
             x=cx, y=cy, text=txt,
             showarrow=False,
@@ -726,9 +726,10 @@ def _monthly_ts(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _apply_axis_style(fig):
-    """Apply dark-theme axis styling to all axes in figure."""
-    for ax in ["xaxis", "yaxis", "xaxis2", "yaxis2", "xaxis3", "yaxis3", "xaxis4", "yaxis4"]:
-        try:
-            fig.update_layout(**{ax: dict(gridcolor=COLORS["grid"], color=COLORS["text"])})
-        except Exception:
-            pass
+    """Apply axis styling only to axes that exist in the figure layout."""
+    axis_style = dict(gridcolor=COLORS["grid"], color=COLORS["text"])
+    existing = [k for k in fig.to_dict().get("layout", {}) if k.startswith(("xaxis", "yaxis"))]
+    if not existing:
+        existing = ["xaxis", "yaxis"]
+    for ax in existing:
+        fig.update_layout(**{ax: axis_style})
