@@ -11,6 +11,8 @@ from src.data_layer import generate_data, compute_kpis
 from src.ai_engine import SalesAIEngine
 from src.visualizations import auto_chart, overview_chart, metric_tree_chart
 from src.role_system import ROLE_CONFIG, get_example_questions
+from src.email_service import compose_email, send_email, is_email_request, html_for_preview
+import streamlit.components.v1 as components
 
 load_dotenv()
 
@@ -138,6 +140,10 @@ def _init_state():
         "az_api_key": os.environ.get("AZURE_OPENAI_API_KEY", ""),
         "az_endpoint": os.environ.get("AZURE_OPENAI_ENDPOINT", ""),
         "az_deployment": os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o"),
+        "email_step": None,
+        "email_address": "",
+        "email_preview": None,
+        "email_result": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -361,17 +367,26 @@ if question:
 
     # Get AI response
     with st.chat_message("assistant", avatar="🤖"):
-        with st.spinner("Analyzing…"):
-            response = engine.ask(
-                question=question,
-                role=role,
-                kpis=kpis,
-                df=df,
+        _is_email = is_email_request(question)
+        if _is_email:
+            response = (
+                "Sure! I'll prepare a summary of our conversation for you. "
+                "Please enter your email address below ↓"
             )
+            st.session_state.email_step = "input"
+        else:
+            with st.spinner("Analyzing…"):
+                response = engine.ask(
+                    question=question,
+                    role=role,
+                    kpis=kpis,
+                    df=df,
+                )
         st.markdown(response)
-        # Inline chart in the message too
-        _inline_key = f"hist_chart_{len(st.session_state.messages)}"
-        st.plotly_chart(new_chart, use_container_width=True, config={"displayModeBar": False}, key=_inline_key)
+        if not _is_email:
+            # Inline chart in the message too
+            _inline_key = f"hist_chart_{len(st.session_state.messages)}"
+            st.plotly_chart(new_chart, use_container_width=True, config={"displayModeBar": False}, key=_inline_key)
 
     # Store in history
     st.session_state.messages.append({
@@ -379,6 +394,96 @@ if question:
         "content": response,
         "chart": new_chart,
     })
+
+# ── Email Flow ────────────────────────────────────────────────────────────────
+
+_email_step = st.session_state.get("email_step")
+
+if _email_step == "input":
+    st.markdown("---")
+    st.markdown("#### ✉️ Send Analysis Summary by Email")
+    with st.form("email_address_form"):
+        _email_input = st.text_input(
+            "Your email address",
+            placeholder="you@example.com",
+            value=st.session_state.get("email_address", ""),
+        )
+        _col1, _col2 = st.columns([3, 1])
+        with _col1:
+            _preview_btn = st.form_submit_button("Preview Email →", use_container_width=True)
+        with _col2:
+            _cancel_btn = st.form_submit_button("Cancel", use_container_width=True)
+
+    if _preview_btn:
+        if not _email_input or "@" not in _email_input or "." not in _email_input.split("@")[-1]:
+            st.error("Please enter a valid email address.")
+        else:
+            # Collect unique charts — deduplicate by title, keep last 3 distinct
+            _seen_titles, _charts = set(), []
+            for _m in st.session_state.messages:
+                _fig = _m.get("chart")
+                if _fig is not None:
+                    _title = (_fig.layout.title.text or "") if _fig.layout.title else ""
+                    if _title not in _seen_titles:
+                        _seen_titles.add(_title)
+                        _charts.append(_fig)
+            _charts = _charts[-3:]
+            _subject, _html_body, _inline_images = compose_email(
+                st.session_state.messages, role, kpis, figures=_charts
+            )
+            st.session_state.email_address  = _email_input
+            st.session_state.email_preview  = (_subject, _html_body, _inline_images)
+            st.session_state.email_step     = "preview"
+            st.rerun()
+    elif _cancel_btn:
+        st.session_state.email_step = None
+        st.rerun()
+
+elif _email_step == "preview":
+    st.markdown("---")
+    st.markdown("#### ✉️ Confirm & Send")
+    _subject, _html_body, _inline_images = st.session_state.email_preview
+    _n_turns = sum(1 for m in st.session_state.messages if m["role"] == "user"
+                   and not is_email_request(m["content"]))
+
+    st.markdown(f"**To:** `{st.session_state.email_address}`")
+    st.markdown(f"**Subject:** {_subject}")
+    st.markdown(f"**Includes:** {_n_turns} question(s) · KPI snapshot · {len(_inline_images)} chart(s) · {role} mode context")
+
+    with st.expander("Preview email content", expanded=True):
+        # Swap cid: → data: URIs so charts render in the browser preview
+        _preview_html = html_for_preview(_html_body, _inline_images)
+        components.html(_preview_html, height=500, scrolling=True)
+
+    _col1, _col2 = st.columns(2)
+    with _col1:
+        if st.button("✉️ Confirm & Send", use_container_width=True, type="primary"):
+            _success, _msg = send_email(
+                st.session_state.email_address, _subject, _html_body, _inline_images
+            )
+            st.session_state.email_result = (_success, _msg)
+            st.session_state.email_step = "sent"
+            st.rerun()
+    with _col2:
+        if st.button("← Edit Email Address", use_container_width=True):
+            st.session_state.email_step = "input"
+            st.rerun()
+
+elif _email_step == "sent":
+    st.markdown("---")
+    _success, _msg = st.session_state.get("email_result", (False, "Unknown error"))
+    if _success:
+        st.success(f"✅ {_msg}")
+    else:
+        st.error(f"❌ {_msg}")
+        st.info(
+            "Gmail tip: Go to myaccount.google.com → Security → App Passwords "
+            "and use that password as SMTP_PASSWORD in your .env file."
+        )
+    if st.button("Done"):
+        st.session_state.email_step = None
+        st.session_state.email_result = None
+        st.rerun()
 
 # ── Footer ────────────────────────────────────────────────────────────────────
 st.markdown("""
