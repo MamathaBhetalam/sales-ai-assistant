@@ -1,17 +1,21 @@
 """
 Business AI Copilot — Main Streamlit Application
-An intelligent sales analytics assistant with role-based AI responses,
+Shopify App Store analytics with role-based AI responses,
 metric tree reasoning, and auto-updating visualizations.
+
+Hot-reload: drop updated CSVs into the  data/  folder and hit Ctrl+R —
+the app detects file changes via mtime fingerprint and reloads automatically.
 """
 import os
 import streamlit as st
 from dotenv import load_dotenv
 
-from src.data_layer import generate_data, compute_kpis
+from src.data_layer import generate_data, compute_kpis, get_data_fingerprint
 from src.ai_engine import SalesAIEngine
 from src.visualizations import auto_chart, overview_chart, metric_tree_chart
 from src.role_system import ROLE_CONFIG, get_example_questions
 from src.email_service import compose_email, send_email, is_email_request, html_for_preview
+from src.entity_extractor import extract_entities
 import streamlit.components.v1 as components
 
 load_dotenv()
@@ -27,16 +31,13 @@ st.set_page_config(
 # ── Custom CSS ────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-  /* ── Base & font ── */
   @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
   html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 
-  /* ── Light background ── */
   .stApp { background-color: #f0f4fb; color: #1a2744; }
   .main .block-container { padding: 1.5rem 2rem 3rem; }
   section[data-testid="stSidebar"] { background-color: #dde6f5; border-right: 1px solid #b8cceb; }
 
-  /* ── Header banner ── */
   .app-header {
     background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 60%, #1e40af 100%);
     border-radius: 12px;
@@ -47,7 +48,6 @@ st.markdown("""
   .app-header h1 { margin: 0; font-size: 1.75rem; font-weight: 700; color: #ffffff; }
   .app-header p  { margin: 0.3rem 0 0; font-size: 0.9rem; color: #bfdbfe; }
 
-  /* ── KPI metric cards ── */
   div[data-testid="metric-container"] {
     background: #ffffff;
     border-radius: 10px;
@@ -60,7 +60,6 @@ st.markdown("""
     font-size: 1.55rem !important; font-weight: 600 !important; color: #1a2744 !important;
   }
 
-  /* ── Chat ── */
   .stChatMessage { background: #ffffff !important; border-radius: 10px !important;
                    border: 1px solid #d1ddf0 !important; margin-bottom: 0.6rem; }
   .stChatMessage p { color: #1a2744 !important; line-height: 1.65; }
@@ -69,7 +68,6 @@ st.markdown("""
     border: 1px solid #b8cceb !important; border-radius: 8px !important;
   }
 
-  /* ── Role badge ── */
   .role-badge {
     display: inline-block;
     padding: 0.3rem 0.8rem;
@@ -79,7 +77,6 @@ st.markdown("""
     margin-bottom: 0.8rem;
   }
 
-  /* ── Sidebar sections ── */
   .sidebar-section {
     background: #ffffff;
     border-radius: 8px;
@@ -90,7 +87,6 @@ st.markdown("""
   .sidebar-section h4 { margin: 0 0 0.5rem; font-size: 0.82rem;
                          color: #64748b; text-transform: uppercase; letter-spacing: 0.05em; }
 
-  /* ── Metric tree display ── */
   .metric-tree {
     font-family: 'Courier New', monospace;
     font-size: 0.78rem;
@@ -101,17 +97,14 @@ st.markdown("""
     border-radius: 6px;
   }
 
-  /* ── Divider ── */
   hr { border-color: #d1ddf0 !important; }
 
-  /* ── Selectbox ── */
   div[data-baseweb="select"] > div {
     background: #ffffff !important;
     border: 1px solid #b8cceb !important;
     color: #1a2744 !important;
   }
 
-  /* ── Button ── */
   .stButton > button {
     background: #ffffff; color: #1a2744;
     border: 1px solid #b8cceb; border-radius: 8px;
@@ -119,7 +112,6 @@ st.markdown("""
   }
   .stButton > button:hover { background: #dde6f5; border-color: #2563eb; }
 
-  /* ── Expander ── */
   details { background: #ffffff !important; border: 1px solid #d1ddf0 !important;
              border-radius: 8px !important; }
   summary { color: #64748b !important; }
@@ -136,7 +128,9 @@ def _init_state():
         "role": "CEO",
         "engine": None,
         "df": None,
+        "tables": None,
         "kpis": None,
+        "data_fingerprint": "",
         "az_api_key": os.environ.get("AZURE_OPENAI_API_KEY", ""),
         "az_endpoint": os.environ.get("AZURE_OPENAI_ENDPOINT", ""),
         "az_deployment": os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o"),
@@ -144,6 +138,7 @@ def _init_state():
         "email_address": "",
         "email_preview": None,
         "email_result": None,
+        "focus_category": None,   # persists detected category across conversation turns
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -153,20 +148,24 @@ def _init_state():
 _init_state()
 
 
-# ── Data Bootstrap ────────────────────────────────────────────────────────────
+# ── Data Bootstrap with Hot-Reload ────────────────────────────────────────────
 
-@st.cache_data(show_spinner="Loading Superstore dataset…")
-def load_data():
-    df = generate_data()
-    kpis = compute_kpis(df)
-    return df, kpis
+@st.cache_data(show_spinner="Loading App Store dataset…")
+def _load_data(fingerprint: str):
+    """Cache key includes fingerprint — auto-invalidates on file changes."""
+    df, tables = generate_data(fingerprint)
+    kpis = compute_kpis(df, tables)
+    return df, tables, kpis
 
 
-if st.session_state.df is None:
-    st.session_state.df, st.session_state.kpis = load_data()
+# Check fingerprint on every run; reload only when CSV files have changed
+_current_fp = get_data_fingerprint()
+if st.session_state.df is None or _current_fp != st.session_state.data_fingerprint:
+    st.session_state.df, st.session_state.tables, st.session_state.kpis = _load_data(_current_fp)
+    st.session_state.data_fingerprint = _current_fp
 
-df = st.session_state.df
-kpis = st.session_state.kpis
+df    = st.session_state.df
+kpis  = st.session_state.kpis
 
 
 # ── AI Engine Init ────────────────────────────────────────────────────────────
@@ -217,22 +216,27 @@ with st.sidebar:
     st.markdown("---")
 
     # Quick KPI snapshot
-    _latest_yr = kpis.get("latest_year", "Latest")
+    _free_color = "#16a34a" if kpis["pct_free"] >= 50 else "#d97706"
     st.markdown("**Quick KPIs**")
     st.markdown(f"""
 <div class="sidebar-section">
-<h4>{_latest_yr} Snapshot</h4>
+<h4>App Store Snapshot</h4>
 <p style="margin:0;font-size:0.82rem;color:#1a2744">
-  Revenue  <strong style="float:right;color:#2563eb">${kpis['revenue_latest']:,.0f}</strong><br><br>
-  Profit   <strong style="float:right;color:#16a34a">${kpis['profit_latest']:,.0f}</strong><br><br>
-  Margin   <strong style="float:right;color:#d97706">{kpis['profit_latest']/kpis['revenue_latest']*100:.1f}%</strong><br><br>
-  YoY Rev  <strong style="float:right;color:{'#16a34a' if kpis['yoy_revenue_growth']>=0 else '#dc2626'}">{kpis['yoy_revenue_growth']:+.1f}%</strong>
+  Total Apps    <strong style="float:right;color:#2563eb">{kpis['total_apps']:,}</strong><br><br>
+  Avg Rating    <strong style="float:right;color:#16a34a">{kpis['avg_rating']:.2f} / 5.0</strong><br><br>
+  Total Reviews <strong style="float:right;color:#d97706">{kpis['total_reviews']:,}</strong><br><br>
+  % Free/Fremm  <strong style="float:right;color:{_free_color}">{kpis['pct_free']:.1f}%</strong><br><br>
+  Categories    <strong style="float:right;color:#7c3aed">{kpis['total_categories']:,}</strong>
 </p>
 </div>
 """, unsafe_allow_html=True)
 
-    # Metric tree — interactive sunburst
-    st.markdown("**Metric Tree** <small style='color:#8b949e;font-size:0.72rem'>Revenue → Category → Sub-Category · Color = Margin%</small>", unsafe_allow_html=True)
+    # Metric tree — sunburst
+    st.markdown(
+        "**Market Map** "
+        "<small style='color:#8b949e;font-size:0.72rem'>Categories → Free/Paid · Color = Avg Rating</small>",
+        unsafe_allow_html=True,
+    )
     st.plotly_chart(
         metric_tree_chart(df, kpis),
         use_container_width=True,
@@ -242,10 +246,19 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # Clear conversation
+    # Hot-reload info
+    st.markdown(
+        "<small style='color:#94a3b8'>💡 Drop updated CSVs into <code>data/</code> "
+        "and refresh the page — data reloads automatically.</small>",
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("---")
+
     if st.button("Clear Conversation", use_container_width=True):
         st.session_state.messages = []
         st.session_state.current_chart = None
+        st.session_state.focus_category = None
         if st.session_state.engine:
             st.session_state.engine.reset_history()
         st.rerun()
@@ -257,7 +270,7 @@ with st.sidebar:
 st.markdown(f"""
 <div class="app-header">
   <h1>🤖 Business AI Copilot</h1>
-  <p>Intelligent sales analytics · Role-aware insights · Metric tree reasoning &nbsp;·&nbsp;
+  <p>Shopify App Store analytics · Role-aware insights · Metric tree reasoning &nbsp;·&nbsp;
      <strong style="color:{cfg['color']}">{cfg['emoji']} {cfg['label']}</strong></p>
 </div>
 """, unsafe_allow_html=True)
@@ -267,34 +280,35 @@ k1, k2, k3, k4, k5 = st.columns(5)
 
 with k1:
     st.metric(
-        "Total Revenue",
-        f"${kpis['total_revenue']/1e6:.1f}M",
-        f"{kpis['yoy_revenue_growth']:+.1f}% YoY",
+        "Total Apps",
+        f"{kpis['total_apps']:,}",
+        f"in {kpis['total_categories']} categories",
     )
 with k2:
     st.metric(
-        "Total Profit",
-        f"${kpis['total_profit']/1e6:.1f}M",
-        f"{kpis['yoy_profit_growth']:+.1f}% YoY",
+        "Avg Rating",
+        f"{kpis['avg_rating']:.2f} / 5.0",
+        f"Best: {kpis['highest_rated_cat'][:18]}",
     )
 with k3:
     st.metric(
-        "Profit Margin",
-        f"{kpis['profit_margin']:.1f}%",
-        f"{kpis['profit_latest']/kpis['revenue_latest']*100 - kpis['profit_prev']/kpis['revenue_prev']*100:+.1f}pp YoY",
+        "Total Reviews",
+        f"{kpis['total_reviews']:,}",
+        f"Top: {kpis['top_category'][:18]}",
     )
 with k4:
     st.metric(
-        "Total Orders",
-        f"{kpis['total_orders']:,}",
-        f"Best: {kpis['best_region']}",
+        "% Free / Freemium",
+        f"{kpis['pct_free']:.1f}%",
+        f"{100 - kpis['pct_free']:.1f}% Paid only",
+        delta_color="off",
     )
 with k5:
     st.metric(
-        "Avg Discount",
-        f"{kpis['avg_discount']:.1f}%",
-        f"High in {kpis['high_discount_cat']}",
-        delta_color="inverse",
+        "Top Developer",
+        kpis["top_developer"][:22],
+        "by app count",
+        delta_color="off",
     )
 
 st.markdown("---")
@@ -302,7 +316,6 @@ st.markdown("---")
 # ── Chart Area ────────────────────────────────────────────────────────────────
 chart_placeholder = st.empty()
 
-# Show default overview or last auto-generated chart
 if st.session_state.current_chart is not None:
     chart_placeholder.plotly_chart(
         st.session_state.current_chart,
@@ -310,9 +323,8 @@ if st.session_state.current_chart is not None:
         config={"displayModeBar": False},
     )
 else:
-    default_fig = overview_chart(df, kpis)
     chart_placeholder.plotly_chart(
-        default_fig,
+        overview_chart(df, kpis),
         use_container_width=True,
         config={"displayModeBar": False},
     )
@@ -320,7 +332,28 @@ else:
 st.markdown("---")
 
 # ── Chat Interface ────────────────────────────────────────────────────────────
-st.markdown(f"#### {cfg['emoji']} AI Assistant &nbsp;<small style='color:#8b949e;font-size:0.8rem'>({cfg['label']})</small>", unsafe_allow_html=True)
+_header_col, _badge_col = st.columns([5, 3])
+with _header_col:
+    st.markdown(
+        f"#### {cfg['emoji']} AI Assistant &nbsp;"
+        f"<small style='color:#8b949e;font-size:0.8rem'>({cfg['label']})</small>",
+        unsafe_allow_html=True,
+    )
+with _badge_col:
+    if st.session_state.focus_category:
+        _fc = st.session_state.focus_category
+        _b1, _b2 = st.columns([4, 1])
+        with _b1:
+            st.markdown(
+                f'<div style="margin-top:0.6rem;padding:0.25rem 0.75rem;border-radius:20px;'
+                f'background:#dbeafe;border:1px solid #93c5fd;color:#1d4ed8;'
+                f'font-size:0.8rem;font-weight:600;">🎯 Focus: {_fc}</div>',
+                unsafe_allow_html=True,
+            )
+        with _b2:
+            if st.button("✕", key="clear_focus", help="Clear category focus"):
+                st.session_state.focus_category = None
+                st.rerun()
 
 # Render conversation history
 for _msg_idx, msg in enumerate(st.session_state.messages):
@@ -345,10 +378,8 @@ if not st.session_state.messages:
                 st.session_state["_pending_question"] = q
                 st.rerun()
 
-# Handle example button press
 pending = st.session_state.pop("_pending_question", None)
 
-# Chat input
 user_input = st.chat_input(
     placeholder=f"{cfg['greeting']} What would you like to explore?",
 )
@@ -356,16 +387,24 @@ user_input = st.chat_input(
 question = user_input or pending
 
 if question:
-    # Display user message immediately
     st.session_state.messages.append({"role": "user", "content": question})
     with st.chat_message("user", avatar="👤"):
         st.markdown(question)
 
-    # Generate chart for this question (stored in session state; top chart updates on next render)
-    new_chart = auto_chart(question, df, kpis)
+    # Extract entities once — shared by chart picker AND AI engine.
+    # If no category is detected in the current question, inherit the persisted
+    # focus category so follow-up questions stay anchored to the same category.
+    _entities = extract_entities(question, kpis)
+    if _entities.get("category"):
+        # New category detected — update persistent focus
+        st.session_state.focus_category = _entities["category"]
+    elif st.session_state.focus_category and not _entities.get("category2"):
+        # No new category in this question — carry the focus forward
+        _entities = {**_entities, "category": st.session_state.focus_category}
+
+    new_chart = auto_chart(question, df, kpis, entities=_entities)
     st.session_state.current_chart = new_chart
 
-    # Get AI response
     with st.chat_message("assistant", avatar="🤖"):
         _is_email = is_email_request(question)
         if _is_email:
@@ -384,11 +423,12 @@ if question:
                 )
         st.markdown(response)
         if not _is_email:
-            # Inline chart in the message too
             _inline_key = f"hist_chart_{len(st.session_state.messages)}"
-            st.plotly_chart(new_chart, use_container_width=True, config={"displayModeBar": False}, key=_inline_key)
+            st.plotly_chart(
+                new_chart, use_container_width=True,
+                config={"displayModeBar": False}, key=_inline_key,
+            )
 
-    # Store in history
     st.session_state.messages.append({
         "role": "assistant",
         "content": response,
@@ -418,7 +458,7 @@ if _email_step == "input":
         if not _email_input or "@" not in _email_input or "." not in _email_input.split("@")[-1]:
             st.error("Please enter a valid email address.")
         else:
-            # Collect unique charts — deduplicate by title, keep last 3 distinct
+            # Deduplicate charts by title, keep last 3 distinct
             _seen_titles, _charts = set(), []
             for _m in st.session_state.messages:
                 _fig = _m.get("chart")
@@ -431,9 +471,9 @@ if _email_step == "input":
             _subject, _html_body, _inline_images = compose_email(
                 st.session_state.messages, role, kpis, figures=_charts
             )
-            st.session_state.email_address  = _email_input
-            st.session_state.email_preview  = (_subject, _html_body, _inline_images)
-            st.session_state.email_step     = "preview"
+            st.session_state.email_address = _email_input
+            st.session_state.email_preview = (_subject, _html_body, _inline_images)
+            st.session_state.email_step    = "preview"
             st.rerun()
     elif _cancel_btn:
         st.session_state.email_step = None
@@ -448,10 +488,12 @@ elif _email_step == "preview":
 
     st.markdown(f"**To:** `{st.session_state.email_address}`")
     st.markdown(f"**Subject:** {_subject}")
-    st.markdown(f"**Includes:** {_n_turns} question(s) · KPI snapshot · {len(_inline_images)} chart(s) · {role} mode context")
+    st.markdown(
+        f"**Includes:** {_n_turns} question(s) · KPI snapshot · "
+        f"{len(_inline_images)} chart(s) · {role} mode context"
+    )
 
     with st.expander("Preview email content", expanded=True):
-        # Swap cid: → data: URIs so charts render in the browser preview
         _preview_html = html_for_preview(_html_body, _inline_images)
         components.html(_preview_html, height=500, scrolling=True)
 
@@ -462,7 +504,7 @@ elif _email_step == "preview":
                 st.session_state.email_address, _subject, _html_body, _inline_images
             )
             st.session_state.email_result = (_success, _msg)
-            st.session_state.email_step = "sent"
+            st.session_state.email_step   = "sent"
             st.rerun()
     with _col2:
         if st.button("← Edit Email Address", use_container_width=True):
@@ -481,7 +523,7 @@ elif _email_step == "sent":
             "and use that password as SMTP_PASSWORD in your .env file."
         )
     if st.button("Done"):
-        st.session_state.email_step = None
+        st.session_state.email_step   = None
         st.session_state.email_result = None
         st.rerun()
 
@@ -489,6 +531,6 @@ elif _email_step == "sent":
 st.markdown("""
 <div style='text-align:center;padding:2rem 0 0.5rem;color:#94a3b8;font-size:0.75rem'>
   Business AI Copilot &nbsp;·&nbsp; Powered by GPT-4o &amp; Streamlit &nbsp;·&nbsp;
-  Metric Tree Reasoning &nbsp;·&nbsp; Superstore Dataset (2015–2018)
+  Metric Tree Reasoning &nbsp;·&nbsp; Shopify App Store Dataset
 </div>
 """, unsafe_allow_html=True)

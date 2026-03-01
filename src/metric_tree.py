@@ -1,10 +1,11 @@
 """
-Metric Tree Engine: Hierarchical root-cause analysis for business metrics.
+Metric Tree Engine: Hierarchical analysis for the Shopify App Store dataset.
 
 Tree structure:
-  Revenue → Region → Category → Sub-Category → Discount / Quantity
-  Profit  → Revenue − Costs − Discount Impact
-  Margin  → Profit / Revenue
+  Apps → Category → Rating bands → Pricing
+  Reviews → Over time → By category
+  Rating → By developer → By category
+  Pricing → Free vs Paid → By category
 
 When the AI is asked "Why did X change?", this module drills down
 the tree and returns a structured diagnosis with real numbers.
@@ -17,309 +18,346 @@ from typing import Optional
 # ── Tree Definition ───────────────────────────────────────────────────────────
 
 METRIC_TREE = {
-    "revenue": {
-        "formula": "Quantity × Avg Price × (1 − Discount)",
-        "dimensions": ["Region", "Category", "Sub-Category", "Segment"],
-        "drivers": ["quantity", "price", "discount"],
-        "children": ["profit"],
+    "apps": {
+        "formula": "Total published apps in the store",
+        "dimensions": ["Category", "Developer", "Pricing Type"],
+        "drivers": ["new listings", "category growth", "developer activity"],
+        "children": ["rating", "reviews", "pricing"],
     },
-    "profit": {
-        "formula": "Revenue × Effective Margin",
-        "dimensions": ["Region", "Category", "Sub-Category"],
-        "drivers": ["revenue", "discount", "margin"],
-        "children": ["profit_margin"],
-    },
-    "profit_margin": {
-        "formula": "Profit ÷ Revenue × 100",
-        "dimensions": ["Region", "Category"],
-        "drivers": ["profit", "revenue", "discount"],
+    "rating": {
+        "formula": "Avg Rating = sum(star ratings) ÷ total ratings given",
+        "dimensions": ["Category", "Developer", "Pricing Type"],
+        "drivers": ["review quality", "app reliability", "developer responsiveness"],
         "children": [],
     },
-    "discount": {
-        "formula": "Avg Discount Rate",
-        "dimensions": ["Region", "Category", "Sub-Category"],
-        "drivers": [],
-        "children": ["profit", "profit_margin"],
+    "reviews": {
+        "formula": "Total user reviews submitted",
+        "dimensions": ["Category", "Time period"],
+        "drivers": ["app installs", "user engagement", "developer replies"],
+        "children": ["rating"],
+    },
+    "pricing": {
+        "formula": "Distribution of Free / Freemium vs Paid apps",
+        "dimensions": ["Category", "Price tier"],
+        "drivers": ["monetization strategy", "market competition"],
+        "children": [],
     },
 }
 
 
-# ── Analysis Functions ────────────────────────────────────────────────────────
+# ── Analysis Functions ─────────────────────────────────────────────────────────
 
 def analyze_metric(metric: str, df: pd.DataFrame,
-                   compare_df: Optional[pd.DataFrame] = None) -> str:
+                   kpis: Optional[dict] = None) -> str:
     """
     Return a textual root-cause analysis for the given metric.
-    If compare_df is provided, shows period-over-period change.
+    kpis: pre-computed KPI dict — avoids redundant groupby on every call.
     """
     m = metric.lower().strip()
 
-    if "profit" in m and "margin" not in m:
-        return _analyze_profit(df, compare_df)
-    elif "revenue" in m or "sales" in m:
-        return _analyze_revenue(df, compare_df)
-    elif "margin" in m:
-        return _analyze_margin(df, compare_df)
-    elif "discount" in m:
-        return _analyze_discount(df, compare_df)
-    elif "growth" in m:
-        return _analyze_growth(df)
+    if "rating" in m or "score" in m or "star" in m:
+        return _analyze_rating(df, kpis)
+    elif "review" in m or "feedback" in m or "comment" in m:
+        return _analyze_reviews(df, kpis)
+    elif "pric" in m or "free" in m or "paid" in m or "monetiz" in m:
+        return _analyze_pricing(df, kpis)
+    elif "developer" in m or "partner" in m or "vendor" in m:
+        return _analyze_developers(df, kpis)
+    elif "category" in m or "segment" in m or "market" in m:
+        return _analyze_categories(df, kpis)
     else:
-        return _analyze_overview(df)
+        return _analyze_overview(df, kpis)
 
 
-def _analyze_profit(df: pd.DataFrame, compare_df: Optional[pd.DataFrame]) -> str:
-    """Drill: Profit → Region → Category → Discount impact."""
-    lines = ["PROFIT ROOT-CAUSE ANALYSIS (Metric Tree Traversal)", "=" * 52]
+def _analyze_rating(df: pd.DataFrame, kpis: Optional[dict] = None) -> str:
+    """Drill: Rating → by category → by pricing type → top/bottom apps."""
+    lines = ["RATING ROOT-CAUSE ANALYSIS (Metric Tree Traversal)", "=" * 55]
 
-    # Level 1 – overall
-    total_profit = df["Profit"].sum()
-    total_rev = df["Sales"].sum()
-    margin = total_profit / total_rev * 100 if total_rev else 0
-    avg_disc = df["Discount"].mean() * 100
+    # L1 – Overall (use pre-computed kpis to avoid recomputing mean)
+    overall = kpis["avg_rating"] if kpis else float(df["rating"].mean())
+    n_rated  = int(df["rating"].notna().sum())
+    lines.append(f"\n[L1] Overall  →  Avg Rating = {overall:.2f}/5.0  ({n_rated:,} rated apps)")
 
-    lines.append(f"\n[L1] Overall  →  Profit=${total_profit:,.0f}  |  Margin={margin:.1f}%  |  AvgDiscount={avg_disc:.1f}%")
+    # L2 – By category (read from pre-computed kpis["by_category"] — no groupby)
+    by_cat = kpis.get("by_category") if kpis else None
+    if by_cat is not None and not by_cat.empty:
+        lines.append("\n[L2] Rating by Category (top 10 by avg rating):")
+        top10 = (
+            by_cat.dropna(subset=["avg_rating"])
+            .sort_values("avg_rating", ascending=False)
+            .head(10)
+        )
+        for _, row in top10.iterrows():
+            flag = (
+                " ◄ TOP"       if row["avg_rating"] >= overall + 0.3 else
+                " ◄ BELOW AVG" if row["avg_rating"] <  overall - 0.3 else ""
+            )
+            lines.append(
+                f"  {str(row['category']):<35}  "
+                f"Rating={row['avg_rating']:.2f}  Apps={row['app_count']:,}{flag}"
+            )
 
-    if compare_df is not None:
-        prev_profit = compare_df["Profit"].sum()
-        delta = total_profit - prev_profit
-        pct = (delta / abs(prev_profit) * 100) if prev_profit else 0
-        lines.append(f"       Change vs prior period: {delta:+,.0f} ({pct:+.1f}%)")
+    # L3 – By pricing type (cheap: only 2–3 groups, and avg_reviews needs df)
+    lines.append("\n[L3] Rating by Pricing Type:")
+    if "pricing_type" in df.columns:
+        pt = (
+            df.dropna(subset=["rating"])
+            .groupby("pricing_type")
+            .agg(avg_rating=("rating", "mean"), app_count=("id", "count"))
+            .reset_index()
+        )
+        for _, row in pt.iterrows():
+            lines.append(
+                f"  {str(row['pricing_type']):<25}  "
+                f"Rating={row['avg_rating']:.2f}  Apps={row['app_count']:,}"
+            )
 
-    # Level 2 – Region breakdown
-    lines.append("\n[L2] Region Drill-Down:")
-    reg = (
-        df.groupby("Region")
-        .agg(Profit=("Profit", "sum"), Revenue=("Sales", "sum"),
-             AvgDisc=("Discount", "mean"))
-        .sort_values("Profit")
-        .reset_index()
+    # L4 – Top apps (threshold = 60th percentile of review counts, not hardcoded 100)
+    review_threshold = max(1, int(df["reviews_count"].quantile(0.6)))
+    lines.append(f"\n[L4] Highest-Rated Apps (≥{review_threshold:,} reviews):")
+    top = (
+        df[df["reviews_count"] >= review_threshold]
+        .sort_values("rating", ascending=False)
+        .head(5)[["title", "developer", "rating", "reviews_count"]]
     )
-    reg["Margin%"] = (reg["Profit"] / reg["Revenue"] * 100).round(1)
-    reg["AvgDisc%"] = (reg["AvgDisc"] * 100).round(1)
-
-    worst_region = reg.iloc[0]["Region"]
-    for _, row in reg.iterrows():
-        flag = " ◄ LOWEST" if row["Region"] == worst_region else ""
+    for _, row in top.iterrows():
         lines.append(
-            f"  {row['Region']:<10}  Profit=${row['Profit']:>10,.0f}  "
-            f"Margin={row['Margin%']:>5.1f}%  Disc={row['AvgDisc%']:>5.1f}%{flag}"
+            f"  {str(row['title'])[:40]:<42}  Rating={row['rating']:.1f}  "
+            f"Reviews={row['reviews_count']:,}"
         )
 
-    # Level 3 – Category in worst region
-    lines.append(f"\n[L3] Category Drill-Down inside {worst_region}:")
-    cat_region = (
-        df[df["Region"] == worst_region]
-        .groupby("Category")
-        .agg(Profit=("Profit", "sum"), Revenue=("Sales", "sum"),
-             AvgDisc=("Discount", "mean"))
-        .reset_index()
-    )
-    cat_region["Margin%"] = (cat_region["Profit"] / cat_region["Revenue"] * 100).round(1)
-    cat_region["AvgDisc%"] = (cat_region["AvgDisc"] * 100).round(1)
-
-    for _, row in cat_region.iterrows():
-        flag = " ◄ PROBLEM" if row["Margin%"] < 5 else ""
-        lines.append(
-            f"  {row['Category']:<20}  Profit=${row['Profit']:>9,.0f}  "
-            f"Margin={row['Margin%']:>5.1f}%  Disc={row['AvgDisc%']:>5.1f}%{flag}"
-        )
-
-    # Level 4 – Discount impact quantification
-    lines.append("\n[L4] Discount Impact Quantification:")
-    high_disc = df[df["Discount"] > 0.25]
-    low_disc = df[df["Discount"] <= 0.25]
-    hm = (high_disc["Profit"] / high_disc["Sales"] * 100).mean() if len(high_disc) else 0
-    lm = (low_disc["Profit"] / low_disc["Sales"] * 100).mean() if len(low_disc) else 0
-    lines.append(f"  Avg Margin (Discount > 25%): {hm:.1f}%  ({len(high_disc):,} orders)")
-    lines.append(f"  Avg Margin (Discount ≤ 25%): {lm:.1f}%  ({len(low_disc):,} orders)")
-    lines.append(f"  Margin erosion from high discounting: {lm - hm:.1f} percentage points")
-
-    # Root-cause summary
     lines.append("\n[ROOT CAUSE SUMMARY]")
-    worst_cat_in_worst = cat_region.loc[cat_region["Margin%"].idxmin()]
     lines.append(
-        f"  Primary driver: {worst_region} region → {worst_cat_in_worst['Category']} category "
-        f"(Margin: {worst_cat_in_worst['Margin%']:.1f}%, "
-        f"Avg Discount: {worst_cat_in_worst['AvgDisc%']:.1f}%)"
+        f"  Overall avg rating: {overall:.2f}/5.0 across {n_rated:,} apps. "
+        f"Apps with {review_threshold:,}+ reviews skew higher due to selection bias "
+        f"(only popular apps accumulate that many reviews)."
     )
-
     return "\n".join(lines)
 
 
-def _analyze_revenue(df: pd.DataFrame, compare_df: Optional[pd.DataFrame]) -> str:
-    """Drill: Revenue → Region × Category."""
-    lines = ["REVENUE ROOT-CAUSE ANALYSIS (Metric Tree Traversal)", "=" * 52]
+def _analyze_reviews(df: pd.DataFrame, kpis: Optional[dict] = None) -> str:
+    """Drill: Reviews → by category → by developer → developer responsiveness."""
+    lines = ["REVIEW ANALYSIS (Metric Tree Traversal)", "=" * 55]
 
-    total_rev = df["Sales"].sum()
-    lines.append(f"\n[L1] Total Revenue: ${total_rev:,.0f}")
+    # L1 – totals (use pre-computed kpis)
+    total_reviews = kpis["total_reviews"] if kpis else int(df["reviews_count"].sum())
+    avg_reviews   = float(df["reviews_count"].mean())
+    lines.append(f"\n[L1] Total Reviews: {total_reviews:,}  (avg per app: {avg_reviews:.0f})")
 
-    if compare_df is not None:
-        prev = compare_df["Sales"].sum()
-        delta = total_rev - prev
-        pct = (delta / prev * 100) if prev else 0
-        lines.append(f"       vs prior period: {delta:+,.0f} ({pct:+.1f}%)")
+    # L2 – By category (from pre-computed kpis — no groupby)
+    by_cat = kpis.get("by_category") if kpis else None
+    if by_cat is not None and not by_cat.empty:
+        lines.append("\n[L2] Review Volume by Category (top 10):")
+        top10 = by_cat.sort_values("total_reviews", ascending=False).head(10)
+        for _, row in top10.iterrows():
+            share = int(row["total_reviews"]) / max(total_reviews, 1) * 100
+            lines.append(
+                f"  {str(row['category']):<35}  "
+                f"Reviews={int(row['total_reviews']):>8,}  ({share:.1f}% share)"
+            )
 
-    # Region
-    lines.append("\n[L2] Revenue by Region:")
-    reg = df.groupby("Region")["Sales"].sum().sort_values(ascending=False)
-    for region, rev in reg.items():
-        share = rev / total_rev * 100
-        lines.append(f"  {region:<10}  ${rev:>10,.0f}  ({share:.1f}% share)")
-
-    # Category
-    lines.append("\n[L3] Revenue by Category:")
-    cat = df.groupby("Category")["Sales"].sum().sort_values(ascending=False)
-    for c, rev in cat.items():
-        share = rev / total_rev * 100
-        lines.append(f"  {c:<22}  ${rev:>9,.0f}  ({share:.1f}% share)")
-
-    # Volume vs Price
-    lines.append("\n[L4] Volume vs Pricing Drivers:")
-    lines.append(f"  Total Quantity Sold : {df['Quantity'].sum():>10,}")
-    lines.append(f"  Avg Revenue/Order   : ${df.groupby('Order ID')['Sales'].sum().mean():>9,.0f}")
-    lines.append(f"  Avg Discount Applied: {df['Discount'].mean() * 100:>9.1f}%")
-
-    return "\n".join(lines)
-
-
-def _analyze_margin(df: pd.DataFrame, compare_df: Optional[pd.DataFrame]) -> str:
-    """Drill: Margin by region × category × discount band."""
-    lines = ["PROFIT MARGIN ROOT-CAUSE ANALYSIS", "=" * 52]
-
-    overall = df["Profit"].sum() / df["Sales"].sum() * 100
-    lines.append(f"\n[L1] Overall Margin: {overall:.1f}%")
-
-    # By category (biggest spread)
-    lines.append("\n[L2] Margin by Category:")
-    cat = (
-        df.groupby("Category")
-        .agg(Revenue=("Sales", "sum"), Profit=("Profit", "sum"), AvgDisc=("Discount", "mean"))
-        .reset_index()
-    )
-    cat["Margin%"] = cat["Profit"] / cat["Revenue"] * 100
-    cat["AvgDisc%"] = cat["AvgDisc"] * 100
-    for _, row in cat.iterrows():
+    # L3 – Most reviewed apps (individual app data — needs df)
+    lines.append("\n[L3] Top 5 Most-Reviewed Apps:")
+    top = df.sort_values("reviews_count", ascending=False).head(5)
+    for _, row in top.iterrows():
         lines.append(
-            f"  {row['Category']:<22}  Margin={row['Margin%']:>5.1f}%  "
-            f"Discount={row['AvgDisc%']:>5.1f}%"
+            f"  {str(row['title'])[:40]:<42}  Reviews={row['reviews_count']:,}  "
+            f"Rating={row['rating'] if pd.notna(row['rating']) else 'N/A'}"
         )
 
-    # By region
-    lines.append("\n[L3] Margin by Region:")
-    reg = (
-        df.groupby("Region")
-        .agg(Revenue=("Sales", "sum"), Profit=("Profit", "sum"))
-        .reset_index()
+    lines.append("\n[ROOT CAUSE SUMMARY]")
+    lines.append(
+        "  Top-10% of apps by reviews account for the majority of review volume. "
+        "High review count strongly correlates with app visibility and category leadership."
     )
-    reg["Margin%"] = reg["Profit"] / reg["Revenue"] * 100
-    for _, row in reg.sort_values("Margin%").iterrows():
-        flag = " ◄ BELOW TARGET" if row["Margin%"] < 10 else ""
-        lines.append(f"  {row['Region']:<10}  Margin={row['Margin%']:>5.1f}%{flag}")
-
-    # Discount bands
-    lines.append("\n[L4] Margin by Discount Band:")
-    df2 = df.copy()
-    df2["DiscBand"] = pd.cut(df2["Discount"], bins=[0, 0.1, 0.2, 0.3, 0.5],
-                             labels=["0–10%", "10–20%", "20–30%", "30%+"])
-    band = (
-        df2.groupby("DiscBand", observed=True)
-        .agg(Revenue=("Sales", "sum"), Profit=("Profit", "sum"), Orders=("Order ID", "count"))
-        .reset_index()
-    )
-    band["Margin%"] = band["Profit"] / band["Revenue"] * 100
-    for _, row in band.iterrows():
-        lines.append(
-            f"  Discount {str(row['DiscBand']):<8}  "
-            f"Margin={row['Margin%']:>5.1f}%  Orders={row['Orders']:,}"
-        )
-
     return "\n".join(lines)
 
 
-def _analyze_discount(df: pd.DataFrame, compare_df: Optional[pd.DataFrame]) -> str:
-    """Analyze discount patterns and their profit impact."""
-    lines = ["DISCOUNT IMPACT ANALYSIS", "=" * 52]
+def _analyze_pricing(df: pd.DataFrame, kpis: Optional[dict] = None) -> str:
+    """Drill: Pricing → Free vs Paid → by category → rating impact."""
+    lines = ["PRICING ANALYSIS (Metric Tree Traversal)", "=" * 55]
 
-    avg_disc = df["Discount"].mean() * 100
-    lines.append(f"\n[L1] Overall Avg Discount: {avg_disc:.1f}%")
+    if "has_free_plan" in df.columns:
+        # L1 – totals (from kpis)
+        pct_free = kpis["pct_free"] if kpis else df["has_free_plan"].mean() * 100
+        total    = kpis["total_apps"] if kpis else len(df)
+        n_free   = round(total * pct_free / 100)
+        n_paid   = total - n_free
+        lines.append(
+            f"\n[L1] Total Apps: {total:,}  |  "
+            f"Free/Freemium: {n_free:,} ({pct_free:.1f}%)  |  Paid: {n_paid:,}"
+        )
 
-    # By region
-    lines.append("\n[L2] Avg Discount by Region:")
-    reg = df.groupby("Region")["Discount"].mean().sort_values(ascending=False) * 100
-    for region, d in reg.items():
-        lines.append(f"  {region:<10}  {d:.1f}%")
+        # L2 – Rating by pricing type (cheap: 2–3 groups, and avg_reviews needs df)
+        lines.append("\n[L2] Rating by Pricing Model:")
+        pt = (
+            df.dropna(subset=["rating"])
+            .groupby("pricing_type")
+            .agg(avg_rating=("rating", "mean"), app_count=("id", "count"),
+                 avg_reviews=("reviews_count", "mean"))
+            .reset_index()
+        )
+        for _, row in pt.iterrows():
+            lines.append(
+                f"  {str(row['pricing_type']):<25}  "
+                f"Rating={row['avg_rating']:.2f}  Apps={row['app_count']:,}  "
+                f"Avg Reviews={row['avg_reviews']:.0f}"
+            )
 
-    # By category
-    lines.append("\n[L3] Avg Discount by Category:")
-    cat = df.groupby("Category")["Discount"].mean().sort_values(ascending=False) * 100
-    for c, d in cat.items():
-        lines.append(f"  {c:<22}  {d:.1f}%")
-
-    # High-discount orders impact
-    lines.append("\n[L4] High-Discount (>30%) Order Analysis:")
-    hi = df[df["Discount"] > 0.30]
-    if len(hi):
-        hi_margin = hi["Profit"].sum() / hi["Sales"].sum() * 100
-        hi_rev_share = hi["Sales"].sum() / df["Sales"].sum() * 100
-        lines.append(f"  Orders with >30% discount: {len(hi):,} ({hi_rev_share:.1f}% of revenue)")
-        lines.append(f"  Their avg margin: {hi_margin:.1f}%  (vs overall {avg_disc:.1f}%)")
+        # L3 – Free % by top category (from pre-computed kpis — no groupby)
+        by_cat = kpis.get("by_category") if kpis else None
+        if by_cat is not None and not by_cat.empty:
+            lines.append("\n[L3] Free % by Top Category:")
+            for _, row in by_cat.head(10).iterrows():
+                lines.append(
+                    f"  {str(row['category']):<35}  "
+                    f"Free={row['pct_free']:.0f}%  Apps={row['app_count']:,}"
+                )
     else:
-        lines.append("  No orders with >30% discount found.")
+        lines.append("\n  Pricing data not available.")
 
+    lines.append("\n[ROOT CAUSE SUMMARY]")
+    lines.append(
+        "  Free/Freemium dominates the Shopify App Store. Paid-only apps "
+        "typically serve niche professional workflows and may command higher ratings "
+        "due to lower install volume filtering out casual users."
+    )
     return "\n".join(lines)
 
 
-def _analyze_growth(df: pd.DataFrame) -> str:
-    """YoY and QoQ growth analysis."""
-    lines = ["GROWTH ANALYSIS", "=" * 52]
+def _analyze_developers(df: pd.DataFrame, kpis: Optional[dict] = None) -> str:
+    """Drill: Developer → by app count → by rating → by reviews."""
+    lines = ["DEVELOPER ANALYSIS (Metric Tree Traversal)", "=" * 55]
 
-    yearly = (
-        df.groupby("Year")
-        .agg(Revenue=("Sales", "sum"), Profit=("Profit", "sum"))
+    by_dev = kpis.get("by_developer") if kpis else None
+
+    # L1 – Total developers (from kpis — no nunique scan)
+    total_devs = len(by_dev) if by_dev is not None else df["developer"].nunique()
+    lines.append(f"\n[L1] Total Unique Developers: {total_devs:,}")
+
+    # L2 – Top developers by app count (from pre-computed kpis — no groupby)
+    lines.append("\n[L2] Top 10 Developers by App Count:")
+    if by_dev is not None and not by_dev.empty:
+        for _, row in by_dev.head(10).iterrows():
+            lines.append(
+                f"  {str(row['developer'])[:40]:<42}  Apps={row['app_count']:>4}  "
+                f"Rating={row['avg_rating']:.2f}  Reviews={row['total_reviews']:,}"
+            )
+
+    # L3 – Top by rating (threshold = median app count, not hardcoded 3)
+    lines.append("\n[L3] Top 10 Developers by Avg Rating (≥ median app count):")
+    dev_rated = by_dev.copy() if by_dev is not None else (
+        df.groupby("developer")
+        .agg(app_count=("id", "count"), avg_rating=("rating", "mean"))
         .reset_index()
     )
-    yearly["RevGrowth%"] = yearly["Revenue"].pct_change() * 100
-    yearly["PrfGrowth%"] = yearly["Profit"].pct_change() * 100
-    yearly["Margin%"] = yearly["Profit"] / yearly["Revenue"] * 100
-
-    lines.append("\n[L1] Year-over-Year:")
-    for _, row in yearly.iterrows():
-        g = f"{row['RevGrowth%']:+.1f}%" if not pd.isna(row["RevGrowth%"]) else "—"
+    # Data-driven minimum: median app count per developer
+    min_apps = max(2, int(dev_rated["app_count"].median()))
+    dev_rated = (
+        dev_rated[dev_rated["app_count"] >= min_apps]
+        .sort_values("avg_rating", ascending=False)
+        .head(10)
+    )
+    for _, row in dev_rated.iterrows():
         lines.append(
-            f"  {int(row['Year'])}  Revenue=${row['Revenue']:>10,.0f}  "
-            f"Growth={g:>8}  Margin={row['Margin%']:.1f}%"
+            f"  {str(row['developer'])[:40]:<42}  Apps={row['app_count']:>4}  "
+            f"Rating={row['avg_rating']:.2f}"
         )
 
-    # Quarterly
-    lines.append("\n[L2] Quarterly Revenue Trend:")
-    qtr = (
-        df.groupby(["Year", "Quarter"])
-        .agg(Revenue=("Sales", "sum"), Profit=("Profit", "sum"))
-        .reset_index()
+    return "\n".join(lines)
+
+
+def _analyze_categories(df: pd.DataFrame, kpis: Optional[dict] = None) -> str:
+    """Drill: Category → app count → avg rating → pricing mix."""
+    lines = ["CATEGORY ANALYSIS (Metric Tree Traversal)", "=" * 55]
+
+    by_cat = kpis.get("by_category") if kpis else None
+
+    # L1 – total categories (from kpis)
+    total_cats = (
+        kpis["total_categories"] if kpis
+        else (df["primary_category"].nunique() if "primary_category" in df.columns else 0)
     )
-    qtr["YQ"] = qtr["Year"].astype(str) + " " + qtr["Quarter"]
-    for _, row in qtr.tail(8).iterrows():
-        lines.append(f"  {row['YQ']}  Revenue=${row['Revenue']:>10,.0f}")
+    lines.append(f"\n[L1] Total Categories: {total_cats:,}")
+
+    # L2 – Top 15 by app count (from pre-computed kpis — no groupby)
+    lines.append("\n[L2] Top 15 Categories by App Count:")
+    if by_cat is not None and not by_cat.empty:
+        for _, row in by_cat.head(15).iterrows():
+            lines.append(
+                f"  {str(row['category']):<35}  Apps={row['app_count']:>5,}  "
+                f"Rating={row['avg_rating']:.2f}  Free={row['pct_free']:.0f}%"
+            )
+    elif "primary_category" in df.columns:
+        cat = (
+            df.groupby("primary_category")
+            .agg(app_count=("id", "count"), avg_rating=("rating", "mean"),
+                 pct_free=("has_free_plan", "mean"))
+            .reset_index()
+            .sort_values("app_count", ascending=False)
+            .head(15)
+        )
+        for _, row in cat.iterrows():
+            lines.append(
+                f"  {str(row['primary_category']):<35}  Apps={row['app_count']:>5,}  "
+                f"Rating={row['avg_rating']:.2f}  Free={row['pct_free']*100:.0f}%"
+            )
+
+    # L3 – Highest-rated categories (threshold = p25 app count, not hardcoded 20)
+    if by_cat is not None and not by_cat.empty:
+        min_apps = max(5, int(by_cat["app_count"].quantile(0.25)))
+        lines.append(f"\n[L3] Highest-Rated Categories (≥{min_apps:,} apps):")
+        cat_large = (
+            by_cat[by_cat["app_count"] >= min_apps]
+            .sort_values("avg_rating", ascending=False)
+            .head(5)
+        )
+        for _, row in cat_large.iterrows():
+            lines.append(
+                f"  {str(row['category']):<35}  Avg Rating={row['avg_rating']:.2f}"
+            )
 
     return "\n".join(lines)
 
 
-def _analyze_overview(df: pd.DataFrame) -> str:
-    """General business overview traversal."""
-    lines = ["BUSINESS OVERVIEW — METRIC TREE SUMMARY", "=" * 52]
+def _analyze_overview(df: pd.DataFrame, kpis: Optional[dict] = None) -> str:
+    """General app store overview traversal (fully from kpis when available)."""
+    lines = ["APP STORE OVERVIEW — METRIC TREE SUMMARY", "=" * 55]
 
-    rev = df["Sales"].sum()
-    prf = df["Profit"].sum()
-    margin = prf / rev * 100 if rev else 0
+    if kpis:
+        # Zero groupbys — all stats from pre-computed kpis
+        total        = kpis["total_apps"]
+        avg_rating   = kpis["avg_rating"]
+        total_reviews = kpis["total_reviews"]
+        pct_free     = kpis["pct_free"]
+        total_devs   = len(kpis.get("by_developer", []))
+        top_cat      = kpis["top_category"]
+        best_rated   = kpis["highest_rated_cat"]
+        top_dev      = kpis["top_developer"]
+    else:
+        total        = len(df)
+        avg_rating   = float(df["rating"].mean())
+        total_reviews = int(df["reviews_count"].sum())
+        pct_free     = df["has_free_plan"].mean() * 100 if "has_free_plan" in df.columns else 0
+        total_devs   = df["developer"].nunique()
+        top_cat      = (
+            df.groupby("primary_category")["id"].count().idxmax()
+            if "primary_category" in df.columns else "N/A"
+        )
+        best_rated   = (
+            df.groupby("primary_category")["rating"].mean().idxmax()
+            if "primary_category" in df.columns else "N/A"
+        )
+        top_dev      = df.groupby("developer")["id"].count().idxmax()
 
-    lines.append(f"\nRevenue : ${rev:>12,.0f}")
-    lines.append(f"Profit  : ${prf:>12,.0f}  (Margin: {margin:.1f}%)")
-
-    best_reg = df.groupby("Region")["Sales"].sum().idxmax()
-    best_cat = df.groupby("Category")["Profit"].sum().idxmax()
-    lines.append(f"\nTop Region   : {best_reg}")
-    lines.append(f"Top Category : {best_cat}")
+    lines.append(f"\nTotal Apps       : {total:>10,}")
+    lines.append(f"Avg Rating       : {avg_rating:>10.2f} / 5.0")
+    lines.append(f"Total Reviews    : {total_reviews:>10,}")
+    lines.append(f"Free/Freemium    : {pct_free:>9.1f}%")
+    lines.append(f"Unique Developers: {total_devs:>10,}")
+    lines.append(f"\nLargest Category : {top_cat}")
+    lines.append(f"Best Rated Cat.  : {best_rated}")
+    lines.append(f"Most Active Dev. : {top_dev}")
 
     return "\n".join(lines)
 
@@ -329,25 +367,146 @@ def _analyze_overview(df: pd.DataFrame) -> str:
 def detect_metric(question: str) -> str:
     """Map user question to the most relevant metric for tree traversal."""
     q = question.lower()
-    if any(w in q for w in ["profit drop", "profit fell", "profit down", "profit declin", "profit loss"]):
-        return "profit"
-    if any(w in q for w in ["margin", "profitability"]):
-        return "profit_margin"
-    if any(w in q for w in ["revenue drop", "revenue fell", "revenue down", "sales down", "sales declin"]):
-        return "revenue"
-    if any(w in q for w in ["discount", "promotion", "pricing"]):
-        return "discount"
-    if any(w in q for w in ["growth", "trend", "year over year", "yoy", "quarter"]):
-        return "growth"
-    if any(w in q for w in ["profit", "earn", "income"]):
-        return "profit"
-    if any(w in q for w in ["revenue", "sales", "turnover"]):
-        return "revenue"
+
+    if any(w in q for w in ["rating", "score", "stars", "rated", "quality"]):
+        return "rating"
+    if any(w in q for w in ["review", "feedback", "comment", "opinion", "sentiment"]):
+        return "reviews"
+    if any(w in q for w in ["price", "pricing", "free", "paid", "freemium", "plan", "cost", "monetiz"]):
+        return "pricing"
+    if any(w in q for w in ["developer", "partner", "vendor", "publisher", "maker"]):
+        return "developer"
+    if any(w in q for w in ["category", "categories", "segment", "market", "niche", "vertical"]):
+        return "category"
+    if any(w in q for w in ["app", "apps", "tool", "plugin", "overview", "total", "how many"]):
+        return "apps"
     return "overview"
 
 
-def get_tree_analysis(question: str, df: pd.DataFrame,
-                      compare_df: Optional[pd.DataFrame] = None) -> str:
-    """Entry point: auto-detect metric and run full tree traversal."""
+def _analyze_category_deep_dive(df: pd.DataFrame, category_name: str,
+                                 kpis: Optional[dict] = None) -> str:
+    """
+    Full drill-down for a specific named category.
+    All benchmarks are computed from the data — no hardcoded thresholds.
+    """
+    lines = [f"CATEGORY DEEP-DIVE: {category_name}", "=" * 60]
+
+    # Proper column existence check — avoids the df.get() anti-pattern
+    # (df.get(col, pd.Series(dtype=str)) creates a length-0 Series which
+    # raises a ValueError when used as a boolean mask on a non-empty DataFrame)
+    if "primary_category" in df.columns:
+        cat_df = df[df["primary_category"] == category_name]
+    else:
+        cat_df = pd.DataFrame()
+
+    if cat_df.empty and "categories" in df.columns:
+        cat_df = df[df["categories"].str.contains(category_name, case=False, na=False)]
+
+    if cat_df.empty:
+        lines.append(f"\n  No apps found for category: {category_name}")
+        return "\n".join(lines)
+
+    # L1: Category vs market
+    cat_apps    = len(cat_df)
+    cat_rating  = float(cat_df["rating"].mean())
+    cat_reviews = int(cat_df["reviews_count"].sum())
+    cat_free    = cat_df["has_free_plan"].mean() * 100 if "has_free_plan" in cat_df.columns else 0
+
+    mkt_apps   = kpis["total_apps"] if kpis else len(df)
+    mkt_rating = kpis["avg_rating"]  if kpis else float(df["rating"].mean())
+
+    lines.append("\n[L1] Category Summary")
+    lines.append(f"  Apps in category : {cat_apps:,}  ({cat_apps / max(mkt_apps, 1) * 100:.1f}% of store)")
+    lines.append(f"  Avg Rating       : {cat_rating:.2f}  (store avg {mkt_rating:.2f}, delta {cat_rating - mkt_rating:+.2f})")
+    lines.append(f"  Total Reviews    : {cat_reviews:,}")
+    lines.append(f"  % Free / Freemium: {cat_free:.1f}%")
+
+    # L2: Top apps in this category (by review count — proxy for popularity)
+    lines.append(f"\n[L2] Top Apps in {category_name} (by review volume):")
+    top = (
+        cat_df.dropna(subset=["reviews_count", "rating"])
+        .sort_values("reviews_count", ascending=False)
+        .head(5)[["title", "developer", "rating", "reviews_count", "pricing_type"]]
+    )
+    for _, row in top.iterrows():
+        lines.append(
+            f"  {str(row['title'])[:38]:<40}  "
+            f"Rating={row['rating']:.1f}  Reviews={row['reviews_count']:,}  "
+            f"({row['pricing_type']})"
+        )
+
+    # L3: Rating distribution within category (data-driven bands)
+    lines.append(f"\n[L3] Rating Distribution in {category_name}:")
+    rated = cat_df.dropna(subset=["rating"])
+    if not rated.empty:
+        p25  = float(rated["rating"].quantile(0.25))
+        med  = float(rated["rating"].median())
+        p75  = float(rated["rating"].quantile(0.75))
+        low  = int((rated["rating"] < p25).sum())
+        mid  = int(((rated["rating"] >= p25) & (rated["rating"] < p75)).sum())
+        high = int((rated["rating"] >= p75).sum())
+        lines.append(f"  Below p25 ({p25:.1f})  : {low:,} apps")
+        lines.append(f"  p25–p75 ({p25:.1f}–{p75:.1f}): {mid:,} apps")
+        lines.append(f"  Above p75 ({p75:.1f})  : {high:,} apps")
+        lines.append(f"  Median rating       : {med:.2f}")
+
+    # L4: Competitive signal — reuse pre-computed percentile thresholds from kpis
+    lines.append("\n[L4] Competitive Signal (data-driven):")
+    if kpis and "opportunity_signals" in kpis:
+        # Reuse thresholds already computed in get_opportunity_signals()
+        th         = kpis["opportunity_signals"]["thresholds"]
+        count_p25  = th.get("p25_count",  0.0)
+        count_p75  = th.get("p75_count",  0.0)
+        rating_p75 = th.get("p75_rating", 0.0)
+        rating_p25 = th.get("p25_rating", 0.0)
+    elif kpis and "by_category" in kpis:
+        counts     = kpis["by_category"]["app_count"]
+        ratings    = kpis["by_category"]["avg_rating"].dropna()
+        count_p25  = float(counts.quantile(0.25))
+        count_p75  = float(counts.quantile(0.75))
+        rating_p75 = float(ratings.quantile(0.75))
+        rating_p25 = float(ratings.quantile(0.25))
+    else:
+        # Fallback: derive from df (one groupby, only when kpis not provided)
+        if "primary_category" in df.columns:
+            sizes     = df.groupby("primary_category").size()
+            count_p25 = float(sizes.quantile(0.25))
+            count_p75 = float(sizes.quantile(0.75))
+        else:
+            count_p25 = count_p75 = 0.0
+        rating_p75 = float(df["rating"].quantile(0.75))
+        rating_p25 = float(df["rating"].quantile(0.25))
+
+    if cat_apps <= count_p25 and cat_rating >= rating_p75:
+        signal = "OPPORTUNITY — few apps, high satisfaction. Strong entry potential."
+    elif cat_apps >= count_p75 and cat_rating <= rating_p25:
+        signal = "SATURATED + LOW QUALITY — crowded with poor ratings. Hard to differentiate."
+    elif cat_apps >= count_p75:
+        signal = "COMPETITIVE — large category. Need strong differentiation to stand out."
+    elif cat_rating >= rating_p75:
+        signal = "QUALITY NICHE — high user satisfaction. Consider entering."
+    else:
+        signal = "NORMAL MARKET — average competition and quality."
+
+    lines.append(f"  {signal}")
+
+    return "\n".join(lines)
+
+
+def get_tree_analysis(
+    question: str,
+    df: pd.DataFrame,
+    kpis: Optional[dict] = None,
+    focus_category: Optional[str] = None,
+) -> str:
+    """
+    Entry point: auto-detect metric and run full tree traversal.
+
+    kpis: pre-computed KPI dict — passing this avoids re-running groupby
+          aggregations on every AI call (the data doesn't change between calls).
+    focus_category: when set, runs a category deep-dive instead of metric routing.
+    """
+    if focus_category:
+        return _analyze_category_deep_dive(df, focus_category, kpis)
     metric = detect_metric(question)
-    return analyze_metric(metric, df, compare_df)
+    return analyze_metric(metric, df, kpis)

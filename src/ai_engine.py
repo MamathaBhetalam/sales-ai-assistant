@@ -9,6 +9,7 @@ from openai import AzureOpenAI
 from .role_system import get_system_prompt
 from .data_layer import format_context
 from .metric_tree import get_tree_analysis
+from .entity_extractor import extract_entities
 
 
 class SalesAIEngine:
@@ -71,12 +72,22 @@ class SalesAIEngine:
                 "You can still explore the data using the charts and KPI cards above."
             )
 
-        # --- Build context blocks ---
-        kpi_context = format_context(kpis)
-        tree_analysis = get_tree_analysis(question, df)
+        # --- Extract named entities (category / developer) from question ---
+        entities      = extract_entities(question, kpis)
+        focus_cat     = entities.get("category")
+
+        # --- Build context blocks (category-aware) ---
+        kpi_context   = format_context(kpis, focus_category=focus_cat)
+        tree_analysis = get_tree_analysis(question, df, kpis=kpis, focus_category=focus_cat)
+
+        # Tell the AI which category was detected (if any) so it frames its answer
+        focus_note = (
+            f"\nDETECTED FOCUS: User is asking specifically about the '{focus_cat}' category. "
+            f"Prioritise the CATEGORY FOCUS section in the data above.\n"
+        ) if focus_cat else ""
 
         system_content = f"""{get_system_prompt(role)}
-
+{focus_note}
 ---
 LIVE BUSINESS DATA (always use these real numbers in your answer):
 
@@ -93,6 +104,7 @@ IMPORTANT RULES:
 - Never fabricate metrics — if data is absent, say so
 - Match your depth and tone to your assigned role
 - The user is asking about a REAL business, not a hypothetical
+- When a specific category is identified, lead with that category's data
 """
 
         # Maintain rolling history (last 6 turns to stay within context)
