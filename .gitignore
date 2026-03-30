@@ -31,3 +31,7 @@ Thumbs.db
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Large data files (too big for GitHub)
+data/apps.csv
+data/reviews.csv
