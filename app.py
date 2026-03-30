@@ -1,12 +1,13 @@
 """
 Business AI Copilot — Main Streamlit Application
-Shopify App Store analytics with role-based AI responses,
+E-Commerce analytics with role-based AI responses,
 metric tree reasoning, and auto-updating visualizations.
 
-Hot-reload: drop updated CSVs into the  data/  folder and hit Ctrl+R —
+Hot-reload: drop updated E-Commerce.csv into the  data/  folder and hit Ctrl+R —
 the app detects file changes via mtime fingerprint and reloads automatically.
 """
 import os
+import re
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -19,6 +20,14 @@ from src.entity_extractor import extract_entities
 import streamlit.components.v1 as components
 
 load_dotenv()
+
+_DOLLAR_RE = re.compile(r'\$(?=[\d,])')
+
+def _md(text: str) -> None:
+    """Render AI-generated markdown, escaping $ before numbers to prevent
+    Streamlit's LaTeX renderer from swallowing currency values."""
+    st.markdown(_DOLLAR_RE.sub(r'\\$', text))
+
 
 # ── Page Config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -87,16 +96,6 @@ st.markdown("""
   .sidebar-section h4 { margin: 0 0 0.5rem; font-size: 0.82rem;
                          color: #64748b; text-transform: uppercase; letter-spacing: 0.05em; }
 
-  .metric-tree {
-    font-family: 'Courier New', monospace;
-    font-size: 0.78rem;
-    color: #475569;
-    line-height: 1.7;
-    background: #f0f4fb;
-    padding: 0.6rem;
-    border-radius: 6px;
-  }
-
   hr { border-color: #d1ddf0 !important; }
 
   div[data-baseweb="select"] > div {
@@ -123,22 +122,24 @@ st.markdown("""
 
 def _init_state():
     defaults = {
-        "messages": [],
-        "current_chart": None,
-        "role": "CEO",
-        "engine": None,
-        "df": None,
-        "tables": None,
-        "kpis": None,
-        "data_fingerprint": "",
-        "az_api_key": os.environ.get("AZURE_OPENAI_API_KEY", ""),
-        "az_endpoint": os.environ.get("AZURE_OPENAI_ENDPOINT", ""),
-        "az_deployment": os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o"),
-        "email_step": None,
-        "email_address": "",
-        "email_preview": None,
-        "email_result": None,
-        "focus_category": None,   # persists detected category across conversation turns
+        "messages":             [],
+        "current_chart":        None,
+        "role":                 "CEO",
+        "engine":               None,
+        "df":                   None,
+        "tables":               None,
+        "kpis":                 None,
+        "data_fingerprint":     "",
+        "az_api_key":           os.environ.get("AZURE_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY", ""),
+        "az_endpoint":          os.environ.get("AZURE_OPENAI_ENDPOINT", ""),
+        "az_deployment":        os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o"),
+        "email_step":           None,
+        "email_address":        "",
+        "email_preview":        None,
+        "email_result":         None,
+        "focus_channel":        None,
+        "focus_country":        None,
+        "metric_tree_expanded": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -150,7 +151,7 @@ _init_state()
 
 # ── Data Bootstrap with Hot-Reload ────────────────────────────────────────────
 
-@st.cache_data(show_spinner="Loading App Store dataset…")
+@st.cache_data(show_spinner="Loading E-Commerce dataset…")
 def _load_data(fingerprint: str):
     """Cache key includes fingerprint — auto-invalidates on file changes."""
     df, tables = generate_data(fingerprint)
@@ -216,39 +217,81 @@ with st.sidebar:
     st.markdown("---")
 
     # Quick KPI snapshot
-    _free_color = "#16a34a" if kpis["pct_free"] >= 50 else "#d97706"
+    yoy = kpis.get("yoy_stats", {})
+    rev_yoy = yoy.get("rev_yoy_pct")
+    rev_yoy_str = f"{rev_yoy:+.1f}%" if rev_yoy is not None else ""
     st.markdown("**Quick KPIs**")
     st.markdown(f"""
 <div class="sidebar-section">
-<h4>App Store Snapshot</h4>
+<h4>E-Commerce Snapshot</h4>
 <p style="margin:0;font-size:0.82rem;color:#1a2744">
-  Total Apps    <strong style="float:right;color:#2563eb">{kpis['total_apps']:,}</strong><br><br>
-  Avg Rating    <strong style="float:right;color:#16a34a">{kpis['avg_rating']:.2f} / 5.0</strong><br><br>
-  Total Reviews <strong style="float:right;color:#d97706">{kpis['total_reviews']:,}</strong><br><br>
-  % Free/Fremm  <strong style="float:right;color:{_free_color}">{kpis['pct_free']:.1f}%</strong><br><br>
-  Categories    <strong style="float:right;color:#7c3aed">{kpis['total_categories']:,}</strong>
+  Total Revenue   <strong style="float:right;color:#2563eb">${kpis['total_revenue']:,.0f}</strong><br><br>
+  Total Orders    <strong style="float:right;color:#16a34a">{kpis['total_orders']:,}</strong><br><br>
+  Conv. Rate      <strong style="float:right;color:#d97706">{kpis['completion_rate']:.1f}%</strong><br><br>
+  Prod Rating     <strong style="float:right;color:#7c3aed">{kpis['avg_product_rating']:.2f} / 5</strong><br><br>
+  Customers       <strong style="float:right;color:#0d9488">{kpis['unique_customers']:,}</strong>
 </p>
 </div>
 """, unsafe_allow_html=True)
 
-    # Metric tree — sunburst
+    # Metric tree — interactive node-edge tree
     st.markdown(
-        "**Market Map** "
-        "<small style='color:#8b949e;font-size:0.72rem'>Categories → Free/Paid · Color = Avg Rating</small>",
+        "**Metric Tree** "
+        "<small style='color:#8b949e;font-size:0.72rem'>Click pillar to expand · Color = Health</small>",
         unsafe_allow_html=True,
     )
-    st.plotly_chart(
-        metric_tree_chart(df, kpis),
+    _tree_fig = metric_tree_chart(df, kpis, expanded=st.session_state.metric_tree_expanded)
+    _tree_state = st.plotly_chart(
+        _tree_fig,
         use_container_width=True,
         config={"displayModeBar": False},
         key="sidebar_metric_tree",
+        on_select="rerun",
     )
+    # Handle node click: toggle pillar expansion + auto-inject drill-down question
+    _PILLAR_IDS = {"rev", "ord", "qual", "geo"}
+    _PILLAR_QUESTIONS = {
+        "rev":  "Break down revenue by channel: LTV per channel, AOV comparison, and which channel has the highest growth potential",
+        "ord":  "Analyze the order funnel: conversion rates by channel, average purchase frequency, and top reasons for cancellations",
+        "qual": "Quality deep dive: product ratings by channel, delivery ratings breakdown, and repeat purchase rate analysis",
+        "geo":  "Geographic breakdown: top 3 markets by revenue with channel mix, conversion rate, and LTV per country",
+    }
+    if _tree_state and _tree_state.selection and _tree_state.selection.points:
+        _pt = _tree_state.selection.points[0]
+        _cid = _pt.get("customdata")
+        if isinstance(_cid, str):
+            if _cid in _PILLAR_IDS:
+                _new = None if st.session_state.metric_tree_expanded == _cid else _cid
+                if _new != st.session_state.metric_tree_expanded:
+                    st.session_state.metric_tree_expanded = _new
+                    if _new is not None:
+                        st.session_state["_pending_question"] = _PILLAR_QUESTIONS[_new]
+                    st.rerun()
+            elif _cid.startswith("ch:"):
+                _ch = _cid[3:]
+                st.session_state.focus_channel = _ch
+                st.session_state["_pending_question"] = (
+                    f"Deep dive on {_ch} channel: revenue share, conversion rate, "
+                    f"LTV per customer, top countries, and how to improve its performance"
+                )
+                st.rerun()
+            elif _cid.startswith("co:"):
+                _co = _cid[3:]
+                st.session_state.focus_country = _co
+                st.session_state["_pending_question"] = (
+                    f"Analyze {_co}: total revenue, channel mix, conversion rate, "
+                    f"and the biggest growth opportunity in this market"
+                )
+                st.rerun()
+            elif _cid == "root" and st.session_state.metric_tree_expanded is not None:
+                st.session_state.metric_tree_expanded = None
+                st.rerun()
 
     st.markdown("---")
 
     # Hot-reload info
     st.markdown(
-        "<small style='color:#94a3b8'>💡 Drop updated CSVs into <code>data/</code> "
+        "<small style='color:#94a3b8'>💡 Drop updated CSV into <code>data/</code> "
         "and refresh the page — data reloads automatically.</small>",
         unsafe_allow_html=True,
     )
@@ -256,9 +299,10 @@ with st.sidebar:
     st.markdown("---")
 
     if st.button("Clear Conversation", use_container_width=True):
-        st.session_state.messages = []
-        st.session_state.current_chart = None
-        st.session_state.focus_category = None
+        st.session_state.messages       = []
+        st.session_state.current_chart  = None
+        st.session_state.focus_channel  = None
+        st.session_state.focus_country  = None
         if st.session_state.engine:
             st.session_state.engine.reset_history()
         st.rerun()
@@ -270,7 +314,7 @@ with st.sidebar:
 st.markdown(f"""
 <div class="app-header">
   <h1>🤖 Business AI Copilot</h1>
-  <p>Shopify App Store analytics · Role-aware insights · Metric tree reasoning &nbsp;·&nbsp;
+  <p>E-Commerce analytics · Role-aware insights · Metric tree reasoning &nbsp;·&nbsp;
      <strong style="color:{cfg['color']}">{cfg['emoji']} {cfg['label']}</strong></p>
 </div>
 """, unsafe_allow_html=True)
@@ -278,38 +322,26 @@ st.markdown(f"""
 # ── KPI Cards Row ─────────────────────────────────────────────────────────────
 k1, k2, k3, k4, k5 = st.columns(5)
 
+_yoy = kpis.get("yoy_stats", {})
+_rev_yoy = _yoy.get("rev_yoy_pct")
+
 with k1:
-    st.metric(
-        "Total Apps",
-        f"{kpis['total_apps']:,}",
-        f"in {kpis['total_categories']} categories",
-    )
+    _rev_delta = (f"{_rev_yoy:+.1f}% vs {_yoy['prior_year']}"
+                  if _rev_yoy is not None else f"Top: {kpis['top_channel']}")
+    st.metric("Total Revenue", f"${kpis['total_revenue']:,.0f}", _rev_delta,
+              delta_color="normal" if _rev_yoy is not None else "off")
 with k2:
-    st.metric(
-        "Avg Rating",
-        f"{kpis['avg_rating']:.2f} / 5.0",
-        f"Best: {kpis['highest_rated_cat'][:18]}",
-    )
+    st.metric("Total Orders", f"{kpis['total_orders']:,}",
+              f"{kpis['completion_rate']:.1f}% completion", delta_color="off")
 with k3:
-    st.metric(
-        "Total Reviews",
-        f"{kpis['total_reviews']:,}",
-        f"Top: {kpis['top_category'][:18]}",
-    )
+    st.metric("Avg Order Value", f"${kpis['avg_order_value']:.2f}",
+              f"{kpis['unique_customers']:,} customers", delta_color="off")
 with k4:
-    st.metric(
-        "% Free / Freemium",
-        f"{kpis['pct_free']:.1f}%",
-        f"{100 - kpis['pct_free']:.1f}% Paid only",
-        delta_color="off",
-    )
+    st.metric("Avg Product Rating", f"{kpis['avg_product_rating']:.2f} / 5",
+              f"Delivery: {kpis['avg_delivery_rating']:.2f}", delta_color="off")
 with k5:
-    st.metric(
-        "Top Developer",
-        kpis["top_developer"][:22],
-        "by app count",
-        delta_color="off",
-    )
+    st.metric("Top Channel", kpis["top_channel"][:22],
+              f"Top: {kpis['top_country'][:18]}", delta_color="off")
 
 st.markdown("---")
 
@@ -340,25 +372,26 @@ with _header_col:
         unsafe_allow_html=True,
     )
 with _badge_col:
-    if st.session_state.focus_category:
-        _fc = st.session_state.focus_category
+    _focus = st.session_state.focus_channel or st.session_state.focus_country
+    if _focus:
         _b1, _b2 = st.columns([4, 1])
         with _b1:
             st.markdown(
                 f'<div style="margin-top:0.6rem;padding:0.25rem 0.75rem;border-radius:20px;'
                 f'background:#dbeafe;border:1px solid #93c5fd;color:#1d4ed8;'
-                f'font-size:0.8rem;font-weight:600;">🎯 Focus: {_fc}</div>',
+                f'font-size:0.8rem;font-weight:600;">🎯 Focus: {_focus}</div>',
                 unsafe_allow_html=True,
             )
         with _b2:
-            if st.button("✕", key="clear_focus", help="Clear category focus"):
-                st.session_state.focus_category = None
+            if st.button("✕", key="clear_focus", help="Clear focus"):
+                st.session_state.focus_channel = None
+                st.session_state.focus_country = None
                 st.rerun()
 
 # Render conversation history
 for _msg_idx, msg in enumerate(st.session_state.messages):
     with st.chat_message(msg["role"], avatar="🤖" if msg["role"] == "assistant" else "👤"):
-        st.markdown(msg["content"])
+        _md(msg["content"])
         if msg.get("chart") is not None:
             st.plotly_chart(
                 msg["chart"],
@@ -391,18 +424,19 @@ if question:
     with st.chat_message("user", avatar="👤"):
         st.markdown(question)
 
-    # Extract entities once — shared by chart picker AND AI engine.
-    # If no category is detected in the current question, inherit the persisted
-    # focus category so follow-up questions stay anchored to the same category.
+    # Extract entities from the current question only.
     _entities = extract_entities(question, kpis)
-    if _entities.get("category"):
-        # New category detected — update persistent focus
-        st.session_state.focus_category = _entities["category"]
-    elif st.session_state.focus_category and not _entities.get("category2"):
-        # No new category in this question — carry the focus forward
-        _entities = {**_entities, "category": st.session_state.focus_category}
+    if _entities.get("channel"):
+        st.session_state.focus_channel = _entities["channel"]
+    if _entities.get("country"):
+        st.session_state.focus_country = _entities["country"]
 
-    new_chart = auto_chart(question, df, kpis, entities=_entities)
+    try:
+        new_chart = auto_chart(question, df, kpis, entities=_entities)
+    except Exception:
+        new_chart = None
+    # Always update current_chart: set to the new chart when relevant,
+    # or None when no chart applies (so the top area resets to overview).
     st.session_state.current_chart = new_chart
 
     with st.chat_message("assistant", avatar="🤖"):
@@ -420,9 +454,11 @@ if question:
                     role=role,
                     kpis=kpis,
                     df=df,
+                    tables=st.session_state.tables,
                 )
-        st.markdown(response)
-        if not _is_email:
+        _md(response)
+        # Only render the inline chart when one was produced for this question
+        if not _is_email and new_chart is not None:
             _inline_key = f"hist_chart_{len(st.session_state.messages)}"
             st.plotly_chart(
                 new_chart, use_container_width=True,
@@ -531,6 +567,6 @@ elif _email_step == "sent":
 st.markdown("""
 <div style='text-align:center;padding:2rem 0 0.5rem;color:#94a3b8;font-size:0.75rem'>
   Business AI Copilot &nbsp;·&nbsp; Powered by GPT-4o &amp; Streamlit &nbsp;·&nbsp;
-  Metric Tree Reasoning &nbsp;·&nbsp; Shopify App Store Dataset
+  Metric Tree Reasoning &nbsp;·&nbsp; E-Commerce Dataset
 </div>
 """, unsafe_allow_html=True)

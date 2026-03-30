@@ -1,26 +1,21 @@
 """
-Data Layer: Loads and processes the Shopify App Store multi-CSV dataset.
+Data Layer: Loads and processes the E-Commerce dataset.
 
-Files expected in  <project_root>/data/:
-  apps.csv                 — one row per app (rating, reviews_count, developer …)
-  categories.csv           — category master list
-  apps_categories.csv      — many-to-many join: app_id ↔ category_id
-  pricing_plans.csv        — pricing plans per app
-  pricing_plan_features.csv— features per pricing plan
-  key_benefits.csv         — key benefit bullets per app
-  reviews.csv              — individual user reviews (1 M+ rows; loaded for trends only)
+File expected in <project_root>/data/:
+  E-Commerce.csv — one row per transaction with columns:
+    CustomerID, Gender, InvoiceDate, InvoiceNumber, ProductID,
+    Quantity, Price, Total, OrderStatus, Country, TrafficSource,
+    SessionDuration, DeviceCategory, Device, OS,
+    DeliveryRating, ProductRating, Sales
 
 Hot-reload: call get_data_fingerprint() on every Streamlit run and pass it as an
-argument to load_data().  Streamlit's @st.cache_data caches on all arguments, so
-a changed mtime/fingerprint automatically invalidates the cache.
+argument to load_data(). Streamlit's @st.cache_data caches on all arguments, so
+a changed mtime automatically invalidates the cache.
 """
 import os
 import glob
 import hashlib
 import pandas as pd
-import numpy as np
-
-# ── Paths ─────────────────────────────────────────────────────────────────────
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(_PROJECT_ROOT, "data")
@@ -29,405 +24,241 @@ DATA_DIR = os.path.join(_PROJECT_ROOT, "data")
 # ── Hot-reload helper ─────────────────────────────────────────────────────────
 
 def get_data_fingerprint() -> str:
-    """
-    Return a hex digest that changes whenever any CSV in DATA_DIR is modified.
-    Pass this as an argument to @st.cache_data-decorated loaders so Streamlit
-    automatically re-runs them when the user updates a file.
-    """
     h = hashlib.md5()
     for path in sorted(glob.glob(os.path.join(DATA_DIR, "*.csv"))):
         h.update(f"{path}:{os.path.getmtime(path)}".encode())
     return h.hexdigest()
 
 
-# ── Raw loaders ───────────────────────────────────────────────────────────────
-
-def _load_raw() -> dict[str, pd.DataFrame]:
-    """Load all CSVs from DATA_DIR; return a dict keyed by table name."""
-    tables = {}
-    for fname in ["apps", "categories", "apps_categories",
-                  "pricing_plans", "pricing_plan_features", "key_benefits"]:
-        path = os.path.join(DATA_DIR, f"{fname}.csv")
-        if os.path.exists(path):
-            tables[fname] = pd.read_csv(path)
-        else:
-            tables[fname] = pd.DataFrame()
-
-    # reviews.csv is large (1 M+ rows) — load only columns needed for trends
-    reviews_path = os.path.join(DATA_DIR, "reviews.csv")
-    if os.path.exists(reviews_path):
-        tables["reviews"] = pd.read_csv(
-            reviews_path,
-            usecols=["app_id", "rating", "posted_at", "helpful_count"],
-            low_memory=True,
-        )
-    else:
-        tables["reviews"] = pd.DataFrame()
-
-    return tables
-
-
-# ── Main data builder ─────────────────────────────────────────────────────────
+# ── Raw loader ────────────────────────────────────────────────────────────────
 
 def generate_data(_fingerprint: str = "") -> tuple[pd.DataFrame, dict]:
     """
-    Build the master apps DataFrame and compute all KPIs.
-
-    The _fingerprint argument is unused internally but forces @st.cache_data
-    to recompute when files change (caller passes get_data_fingerprint()).
+    Load and enrich the E-Commerce CSV.
 
     Returns:
-        df    : apps-level DataFrame (one row per app, enriched with category/pricing)
-        tables: raw sub-tables dict for chart-level access
+        df    : enriched transactions DataFrame
+        tables: empty dict (kept for API compatibility with ai_engine)
     """
-    tables = _load_raw()
-    apps = tables["apps"].copy()
-    categories = tables["categories"]
-    apps_cats = tables["apps_categories"]
-    pricing = tables["pricing_plans"]
+    path = os.path.join(DATA_DIR, "E-Commerce.csv")
+    df = pd.read_csv(path)
 
-    # --- 1. Derive primary category + full category list per app ---------------
-    if not apps_cats.empty and not categories.empty:
-        cat_lookup = categories.set_index("id")["title"].to_dict()
+    # ── 1. Parse dates ─────────────────────────────────────────────────────
+    df["InvoiceDate"] = pd.to_datetime(df["InvoiceDate"], dayfirst=False, errors="coerce")
+    df["year_month"] = df["InvoiceDate"].dt.to_period("M").astype(str)
+    df["year"] = df["InvoiceDate"].dt.year
 
-        # Primary category = first assignment for each app
-        primary = (
-            apps_cats.groupby("app_id")["category_id"]
-            .first()
-            .map(cat_lookup)
-            .reset_index()
-            .rename(columns={"category_id": "primary_category"})
-        )
-        apps = apps.merge(primary, left_on="id", right_on="app_id", how="left").drop(
-            columns=["app_id"], errors="ignore"
-        )
+    # ── 2. Clean numeric columns ───────────────────────────────────────────
+    for col in ["Quantity", "Price", "Total", "Sales", "SessionDuration",
+                "DeliveryRating", "ProductRating"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        # All categories as a list string
-        all_cats = (
-            apps_cats.assign(cat_title=apps_cats["category_id"].map(cat_lookup))
-            .groupby("app_id")["cat_title"]
-            .apply(lambda x: ", ".join(x.dropna()))
-            .reset_index()
-            .rename(columns={"cat_title": "categories"})
-        )
-        apps = apps.merge(all_cats, left_on="id", right_on="app_id", how="left").drop(
-            columns=["app_id"], errors="ignore"
-        )
-    else:
-        apps["primary_category"] = "Unknown"
-        apps["categories"] = ""
+    # ── 3. Completion flag ────────────────────────────────────────────────
+    df["is_completed"] = df["OrderStatus"].str.strip().str.lower() == "completed"
 
-    # --- 2. Pricing: flag free-plan apps --------------------------------------
-    if not pricing.empty:
-        has_free = (
-            pricing[pricing["price"].str.lower().str.contains("free", na=False)]["app_id"]
-            .unique()
-        )
-        apps["has_free_plan"] = apps["id"].isin(has_free)
-        apps["pricing_type"] = apps["has_free_plan"].map(
-            {True: "Free / Freemium", False: "Paid only"}
-        )
-    else:
-        apps["has_free_plan"] = False
-        apps["pricing_type"] = "Unknown"
+    # ── 4. Normalise TrafficSource casing / typos ─────────────────────────
+    df["TrafficSource"] = df["TrafficSource"].str.strip()
 
-    # --- 3. Temporal: parse lastmod -------------------------------------------
-    if "lastmod" in apps.columns:
-        apps["lastmod"] = pd.to_datetime(apps["lastmod"], errors="coerce")
-        apps["year_updated"] = apps["lastmod"].dt.year
-    else:
-        apps["year_updated"] = np.nan
+    # ── 5. Revenue = Sales (only credited for completed orders in source) ─
+    df["revenue"] = df["Sales"].fillna(0)
 
-    # --- 4. Clean numeric columns ---------------------------------------------
-    apps["rating"] = pd.to_numeric(apps["rating"], errors="coerce")
-    apps["reviews_count"] = pd.to_numeric(apps["reviews_count"], errors="coerce").fillna(0).astype(int)
-
-    return apps, tables
+    return df, {}
 
 
 # ── KPI Computation ───────────────────────────────────────────────────────────
 
-def compute_kpis(apps: pd.DataFrame, tables: dict) -> dict:
-    """Compute the full KPI set from the enriched apps DataFrame."""
-    categories = tables.get("categories", pd.DataFrame())
-    apps_cats = tables.get("apps_categories", pd.DataFrame())
-    pricing = tables.get("pricing_plans", pd.DataFrame())
-    reviews = tables.get("reviews", pd.DataFrame())
+def compute_kpis(df: pd.DataFrame, tables: dict = {}) -> dict:  # noqa: ARG001
+    """Compute the full KPI set from the enriched transactions DataFrame."""
 
-    total_apps = len(apps)
-    avg_rating = apps["rating"].mean()
-    total_reviews = int(apps["reviews_count"].sum())
-    total_categories = len(categories) if not categories.empty else 0
-    pct_free = apps["has_free_plan"].mean() * 100 if total_apps else 0
+    completed = df[df["is_completed"]]
 
-    # --- By-category aggregation (for breakdowns) ---
-    if not apps_cats.empty and not categories.empty:
-        cat_lookup = categories.set_index("id")["title"].to_dict()
-        by_cat = (
-            apps_cats
-            .assign(category=apps_cats["category_id"].map(cat_lookup))
-            .merge(
-                apps[["id", "rating", "reviews_count", "has_free_plan"]],
-                left_on="app_id", right_on="id", how="left"
-            )
-            .groupby("category")
-            .agg(
-                app_count=("app_id", "nunique"),
-                avg_rating=("rating", "mean"),
-                total_reviews=("reviews_count", "sum"),
-                pct_free=("has_free_plan", "mean"),
-            )
-            .reset_index()
-        )
-        by_cat["avg_rating"] = by_cat["avg_rating"].round(2)
-        by_cat["pct_free"] = (by_cat["pct_free"] * 100).round(1)
-        by_cat["total_reviews"] = by_cat["total_reviews"].astype(int)
-        by_cat = by_cat.sort_values("app_count", ascending=False).reset_index(drop=True)
-    else:
-        by_cat = pd.DataFrame(columns=["category", "app_count", "avg_rating",
-                                        "total_reviews", "pct_free"])
+    total_orders     = len(df)
+    completed_orders = len(completed)
+    completion_rate  = completed_orders / total_orders * 100 if total_orders else 0
+    total_revenue    = float(df["revenue"].sum())
+    unique_customers = int(df["CustomerID"].nunique())
+    avg_order_value  = float(completed["Total"].mean()) if not completed.empty else 0.0
 
-    top_category = by_cat.iloc[0]["category"] if not by_cat.empty else "N/A"
-    highest_rated_cat = (
-        by_cat.loc[by_cat["avg_rating"].idxmax(), "category"]
-        if not by_cat.empty else "N/A"
+    # Ratings only on completed orders with a real rating
+    rated = completed[completed["ProductRating"] > 0]
+    avg_product_rating  = float(rated["ProductRating"].mean()) if not rated.empty else 0.0
+    rated_d = completed[completed["DeliveryRating"] > 0]
+    avg_delivery_rating = float(rated_d["DeliveryRating"].mean()) if not rated_d.empty else 0.0
+
+    # Retention and purchase frequency (completed orders only)
+    cust_orders = (
+        completed.groupby("CustomerID")["InvoiceNumber"].count()
+        .reset_index()
+        .rename(columns={"InvoiceNumber": "order_count"})
     )
+    customers_who_bought = int(completed["CustomerID"].nunique())
+    repeat_customers     = int((cust_orders["order_count"] > 1).sum())
+    # Denominator = customers who actually completed ≥1 order, not all visitors
+    retention_rate    = repeat_customers / customers_who_bought * 100 if customers_who_bought else 0.0
+    avg_purchase_freq = float(cust_orders["order_count"].mean()) if not cust_orders.empty else 1.0
 
-    # --- Developer aggregation ---
-    dev = (
-        apps.groupby("developer")
+    # ── By-channel aggregation ─────────────────────────────────────────────
+    by_channel = (
+        df.groupby("TrafficSource")
         .agg(
-            app_count=("id", "count"),
-            avg_rating=("rating", "mean"),
-            total_reviews=("reviews_count", "sum"),
+            orders=("InvoiceNumber", "count"),
+            revenue=("revenue", "sum"),
+            completed=("is_completed", "sum"),
+            avg_product_rating=("ProductRating", lambda x: x[x > 0].mean()),
+            avg_delivery_rating=("DeliveryRating", lambda x: x[x > 0].mean()),
+            avg_session=("SessionDuration", "mean"),
         )
         .reset_index()
-        .sort_values("app_count", ascending=False)
+    )
+    by_channel["completion_rate"] = (by_channel["completed"] / by_channel["orders"] * 100).round(1)
+    by_channel["avg_product_rating"] = by_channel["avg_product_rating"].round(2)
+    by_channel["avg_delivery_rating"] = by_channel["avg_delivery_rating"].round(2)
+    by_channel["avg_session"] = by_channel["avg_session"].round(2)
+    by_channel = by_channel.sort_values("revenue", ascending=False).reset_index(drop=True)
+
+    # LTV per channel: each customer attributed to their PRIMARY channel (most completed
+    # orders), then avg of total lifetime revenue across those customers per channel.
+    # This avoids double-counting customers who bought across multiple channels.
+    _cust_primary_ch = (
+        completed.groupby(["CustomerID", "TrafficSource"])
+        .size()
+        .reset_index(name="ch_orders")
+        .sort_values(["CustomerID", "ch_orders"], ascending=[True, False])
+        .drop_duplicates(subset=["CustomerID"], keep="first")[["CustomerID", "TrafficSource"]]
+    )
+    _cust_total_ltv = (
+        completed.groupby("CustomerID")["revenue"].sum()
+        .reset_index()
+        .rename(columns={"revenue": "customer_ltv"})
+    )
+    ltv_by_ch = (
+        _cust_primary_ch.merge(_cust_total_ltv, on="CustomerID")
+        .groupby("TrafficSource")["customer_ltv"].mean()
+        .reset_index()
+        .rename(columns={"customer_ltv": "avg_ltv"})
+    )
+    ltv_by_ch["avg_ltv"] = ltv_by_ch["avg_ltv"].round(2)
+    by_channel = by_channel.merge(ltv_by_ch, on="TrafficSource", how="left")
+
+    top_channel = by_channel.iloc[0]["TrafficSource"] if not by_channel.empty else "N/A"
+
+    # ── By-country aggregation ─────────────────────────────────────────────
+    by_country = (
+        df.groupby("Country")
+        .agg(
+            orders=("InvoiceNumber", "count"),
+            revenue=("revenue", "sum"),
+            unique_customers=("CustomerID", "nunique"),
+        )
+        .reset_index()
+        .sort_values("revenue", ascending=False)
         .reset_index(drop=True)
     )
-    top_developer = dev.iloc[0]["developer"] if not dev.empty else "N/A"
+    top_country = by_country.iloc[0]["Country"] if not by_country.empty else "N/A"
 
-    # --- Rating distribution ---
-    bins = [0, 1, 2, 3, 4, 4.5, 5.01]
-    labels = ["0–1", "1–2", "2–3", "3–4", "4–4.5", "4.5–5"]
-    apps_rated = apps.dropna(subset=["rating"])
-    if len(apps_rated):
-        rating_dist = (
-            apps_rated.assign(
-                band=pd.cut(apps_rated["rating"], bins=bins, labels=labels, right=False)
-            )
-            .groupby("band", observed=True)
-            .size()
-            .reset_index(name="count")
+    # ── By-device aggregation ──────────────────────────────────────────────
+    by_device = (
+        df.groupby("DeviceCategory")
+        .agg(orders=("InvoiceNumber", "count"), revenue=("revenue", "sum"))
+        .reset_index()
+        .sort_values("orders", ascending=False)
+        .reset_index(drop=True)
+    )
+
+    # ── Order status breakdown ─────────────────────────────────────────────
+    status_breakdown = df["OrderStatus"].value_counts().reset_index()
+    status_breakdown.columns = ["status", "count"]
+
+    # ── Revenue trend (monthly) ────────────────────────────────────────────
+    revenue_trend = (
+        df.groupby("year_month")
+        .agg(
+            order_count=("InvoiceNumber", "count"),
+            revenue=("revenue", "sum"),
+            avg_rating=("ProductRating", lambda x: x[x > 0].mean()),
         )
+        .reset_index()
+        .sort_values("year_month")
+    )
+    revenue_trend["avg_rating"] = revenue_trend["avg_rating"].round(2)
+
+    # ── Gender split ───────────────────────────────────────────────────────
+    by_gender = (
+        df.groupby("Gender")
+        .agg(orders=("InvoiceNumber", "count"), revenue=("revenue", "sum"))
+        .reset_index()
+    )
+
+    # ── Rating distribution ────────────────────────────────────────────────
+    bins   = [0, 1, 2, 3, 4, 4.5, 5.01]
+    labels = ["0–1", "1–2", "2–3", "3–4", "4–4.5", "4.5–5"]
+    pr = rated["ProductRating"].dropna()
+    if len(pr):
+        rating_dist = (
+            pd.cut(pr, bins=bins, labels=labels, right=False)
+            .value_counts()
+            .reindex(labels, fill_value=0)
+            .reset_index()
+        )
+        rating_dist.columns = ["band", "count"]
     else:
         rating_dist = pd.DataFrame({"band": labels, "count": [0] * len(labels)})
 
-    # --- Pricing breakdown ---
-    pricing_breakdown = (
-        apps.groupby("pricing_type")
-        .agg(app_count=("id", "count"), avg_rating=("rating", "mean"))
-        .reset_index()
-    )
+    # ── YoY stats ─────────────────────────────────────────────────────────
+    yoy_stats = _compute_yoy(revenue_trend)
 
-    # --- Review trend (from reviews.csv if available) ---
-    if not reviews.empty and "posted_at" in reviews.columns:
-        reviews["posted_dt"] = pd.to_datetime(reviews["posted_at"], errors="coerce")
-        reviews["year_month"] = reviews["posted_dt"].dt.to_period("M")
-        review_trend = (
-            reviews.groupby("year_month")
-            .agg(review_count=("rating", "count"), avg_rating=("rating", "mean"))
-            .reset_index()
-        )
-        review_trend["year_month"] = review_trend["year_month"].astype(str)
-        review_trend = review_trend.sort_values("year_month")
-    else:
-        review_trend = pd.DataFrame(columns=["year_month", "review_count", "avg_rating"])
-
-    # Build the kpis dict first, then attach opportunity signals which need
-    # by_category to be present — both functions live in this module so no
-    # circular import; signals are computed once here and reused everywhere.
     kpis: dict = {
-        "total_apps": total_apps,
-        "avg_rating": round(avg_rating, 2) if not np.isnan(avg_rating) else 0,
-        "total_reviews": total_reviews,
-        "total_categories": total_categories,
-        "pct_free": round(pct_free, 1),
-        "top_category": top_category,
-        "highest_rated_cat": highest_rated_cat,
-        "top_developer": top_developer,
-        "by_category": by_cat,
-        "by_developer": dev,
-        "rating_dist": rating_dist,
-        "pricing_breakdown": pricing_breakdown,
-        "review_trend": review_trend,
+        "total_orders":         total_orders,
+        "completed_orders":     completed_orders,
+        "completion_rate":      round(completion_rate, 1),
+        "total_revenue":        round(total_revenue, 2),
+        "unique_customers":     unique_customers,
+        "avg_order_value":      round(avg_order_value, 2),
+        "avg_product_rating":   round(avg_product_rating, 2),
+        "avg_delivery_rating":  round(avg_delivery_rating, 2),
+        "retention_rate":       round(retention_rate, 1),
+        "repeat_customers":     repeat_customers,
+        "avg_purchase_freq":    round(avg_purchase_freq, 2),
+        "top_channel":          top_channel,
+        "top_country":          top_country,
+        "by_channel":           by_channel,
+        "by_country":           by_country,
+        "by_device":            by_device,
+        "by_gender":            by_gender,
+        "status_breakdown":     status_breakdown,
+        "revenue_trend":        revenue_trend,
+        "rating_dist":          rating_dist,
+        "yoy_stats":            yoy_stats,
     }
-    kpis["opportunity_signals"] = get_opportunity_signals(kpis)
     return kpis
 
 
-# ── Opportunity Signal Detection ─────────────────────────────────────────────
+# ── YoY helper ────────────────────────────────────────────────────────────────
 
-def get_opportunity_signals(kpis: dict) -> dict:
-    """
-    Identify under-served and over-saturated categories using data-driven
-    percentile thresholds — no hardcoded numbers.
+def _compute_yoy(revenue_trend: pd.DataFrame) -> dict:
+    if revenue_trend.empty:
+        return {}
+    trend = revenue_trend.copy()
+    trend["year"] = trend["year_month"].str[:4]
+    years = sorted(trend["year"].unique())
+    if len(years) < 2:
+        return {}
+    curr_year  = years[-1]
+    prior_year = years[-2]
+    curr  = trend[trend["year"] == curr_year]
+    prior = trend[trend["year"] == prior_year]
 
-    Under-served  = low app count (below p25) AND high avg rating (above p75)
-                    → quality niche with room for new entrants
-    Over-saturated = high app count (above p75) AND low avg rating (below p25)
-                    → crowded market with dissatisfied users (hard to stand out)
-    """
-    by_cat = kpis["by_category"].dropna(subset=["avg_rating"]).copy()
-    if by_cat.empty:
-        return {"under_served": pd.DataFrame(), "over_saturated": pd.DataFrame(),
-                "thresholds": {}}
+    curr_rev  = float(curr["revenue"].sum())
+    prior_rev = float(prior["revenue"].sum())
+    rev_yoy   = (curr_rev - prior_rev) / prior_rev * 100 if prior_rev else None
 
-    # Noise filter: drop categories with negligible review volume.
-    # Geographic entries / data artifacts typically have 0–few reviews while
-    # real product categories accumulate significant engagement.
-    # Threshold = 10th percentile of total_reviews across all categories (data-driven).
-    min_reviews = max(1.0, float(np.percentile(by_cat["total_reviews"], 10)))
-    by_cat = by_cat[by_cat["total_reviews"] >= min_reviews]
-
-    if by_cat.empty:
-        return {"under_served": pd.DataFrame(), "over_saturated": pd.DataFrame(),
-                "thresholds": {}}
-
-    p25_count  = float(np.percentile(by_cat["app_count"], 25))
-    p75_count  = float(np.percentile(by_cat["app_count"], 75))
-    p25_rating = float(np.percentile(by_cat["avg_rating"], 25))
-    p75_rating = float(np.percentile(by_cat["avg_rating"], 75))
-
-    under_served = (
-        by_cat[
-            (by_cat["app_count"] <= p25_count) &
-            (by_cat["avg_rating"] >= p75_rating)
-        ]
-        .sort_values("avg_rating", ascending=False)
-        .head(5)
-    )
-    over_saturated = (
-        by_cat[
-            (by_cat["app_count"] >= p75_count) &
-            (by_cat["avg_rating"] <= p25_rating)
-        ]
-        .sort_values("app_count", ascending=False)
-        .head(5)
-    )
+    curr_orders  = int(curr["order_count"].sum())
+    prior_orders = int(prior["order_count"].sum())
+    ord_yoy      = (curr_orders - prior_orders) / prior_orders * 100 if prior_orders else None
 
     return {
-        "under_served": under_served,
-        "over_saturated": over_saturated,
-        "thresholds": {
-            "p25_count": p25_count,
-            "p75_count": p75_count,
-            "p25_rating": p25_rating,
-            "p75_rating": p75_rating,
-            "min_reviews": min_reviews,
-        },
+        "rev_yoy_pct":   round(rev_yoy, 1)   if rev_yoy is not None   else None,
+        "order_yoy_pct": round(ord_yoy, 1)   if ord_yoy is not None   else None,
+        "curr_year":     curr_year,
+        "prior_year":    prior_year,
     }
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _category_signal(app_count: int, avg_rating: float, thresholds: dict) -> str:
-    """
-    Return a human-readable market signal for a category.
-    Extracted from the f-string so it's testable and readable.
-    All comparisons use data-driven percentile thresholds, never hardcoded values.
-    """
-    if app_count <= thresholds.get("p25_count", 0) and avg_rating >= thresholds.get("p75_rating", 0):
-        return "OPPORTUNITY (quality niche)"
-    if app_count >= thresholds.get("p75_count", 0) and avg_rating <= thresholds.get("p25_rating", 0):
-        return "SATURATED (crowded+low quality)"
-    return "COMPETITIVE (normal market)"
-
-
-# ── AI Context Formatter ──────────────────────────────────────────────────────
-
-def format_context(kpis: dict, focus_category: str | None = None) -> str:
-    """
-    Render KPIs as a compact text block for AI prompt injection.
-
-    When focus_category is provided (detected from user's question), prepend a
-    detailed category deep-dive section so the AI can answer category-specific
-    questions with real numbers.
-    """
-    by_cat = kpis["by_category"]
-    by_dev = kpis["by_developer"]
-
-    top_cats = by_cat.head(10)[["category", "app_count", "avg_rating",
-                                 "total_reviews", "pct_free"]].to_string(index=False)
-    top_devs = by_dev.head(10)[["developer", "app_count", "avg_rating",
-                                  "total_reviews"]].to_string(index=False)
-    pricing = kpis["pricing_breakdown"].to_string(index=False)
-
-    # ── Opportunity signals — read from pre-computed value in kpis (no recompute) ─
-    signals = kpis.get("opportunity_signals") or get_opportunity_signals(kpis)
-    th = signals["thresholds"]
-    opp_lines = []
-    if not signals["under_served"].empty:
-        for _, row in signals["under_served"].iterrows():
-            opp_lines.append(
-                f"  OPPORTUNITY  {row['category']:<30}  "
-                f"Apps={row['app_count']:,}  Rating={row['avg_rating']:.2f}"
-            )
-    if not signals["over_saturated"].empty:
-        for _, row in signals["over_saturated"].iterrows():
-            opp_lines.append(
-                f"  SATURATED    {row['category']:<30}  "
-                f"Apps={row['app_count']:,}  Rating={row['avg_rating']:.2f}"
-            )
-    opp_block = "\n".join(opp_lines) if opp_lines else "  (insufficient data)"
-
-    base = f"""
-=== SHOPIFY APP STORE — INTELLIGENCE SNAPSHOT ===
-
-OVERALL KPIs:
-  Total Apps       : {kpis['total_apps']:>10,}
-  Avg Rating       : {kpis['avg_rating']:>10.2f} / 5.0
-  Total Reviews    : {kpis['total_reviews']:>10,}
-  Total Categories : {kpis['total_categories']:>10,}
-  % Free / Freemium: {kpis['pct_free']:>9.1f}%
-
-TOP 10 CATEGORIES (by app count):
-{top_cats}
-
-TOP 10 DEVELOPERS (by app count):
-{top_devs}
-
-PRICING BREAKDOWN:
-{pricing}
-
-MARKET OPPORTUNITY SIGNALS
-(Thresholds derived from data: low_count≤{th.get('p25_count',0):.0f}, high_rating≥{th.get('p75_rating',0):.2f},
- high_count≥{th.get('p75_count',0):.0f}, low_rating≤{th.get('p25_rating',0):.2f})
-{opp_block}
-
-KEY FINDINGS:
-  • Largest category  : {kpis['top_category']}
-  • Highest-rated cat.: {kpis['highest_rated_cat']}
-  • Most active dev.  : {kpis['top_developer']}
-  • Free/Freemium apps: {kpis['pct_free']:.1f}% of total
-""".strip()
-
-    # ── Optional: category deep-dive block ────────────────────────────────────
-    if focus_category:
-        row = by_cat[by_cat["category"] == focus_category]
-        if not row.empty:
-            r = row.iloc[0]
-            vs_rating = r["avg_rating"] - kpis["avg_rating"]
-            vs_count  = r["app_count"] - by_cat["app_count"].mean()
-            deep = f"""
-
---- CATEGORY FOCUS: {focus_category} ---
-  App Count    : {r['app_count']:,}  ({vs_count:+.0f} vs store avg {by_cat['app_count'].mean():.0f})
-  Avg Rating   : {r['avg_rating']:.2f}  ({vs_rating:+.2f} vs store avg {kpis['avg_rating']:.2f})
-  Total Reviews: {r['total_reviews']:,}
-  % Free/Fremm : {r['pct_free']:.1f}%
-  Signal       : {_category_signal(int(r['app_count']), float(r['avg_rating']), th)}
-"""
-            base += deep
-
-    return base

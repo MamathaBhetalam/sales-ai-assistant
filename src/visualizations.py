@@ -1,17 +1,15 @@
 """
-Visualizations: Auto-generated Plotly charts for the Shopify App Store dataset.
+Visualizations: Auto-generated Plotly charts for the E-Commerce dataset.
 
 auto_chart()        — keyword-routing: picks the best chart for a given question
-overview_chart()    — default landing view (top categories bar chart)
-metric_tree_chart() — sidebar sunburst: Categories → Free/Paid split (color=rating)
+overview_chart()    — default landing view (revenue by channel bar chart)
+metric_tree_chart() — sidebar node-edge KPI hierarchy (click to expand)
 """
+import re
 import pandas as pd
-import numpy as np
-import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from src.data_layer import get_opportunity_signals
 from src.entity_extractor import extract_entities as _extract_entities
 
 # ── Palette ───────────────────────────────────────────────────────────────────
@@ -24,8 +22,6 @@ _SLATE  = "#64748b"
 _BG     = "#ffffff"
 _GRID   = "#e2e8f0"
 
-
-# ── Shared style helpers ──────────────────────────────────────────────────────
 
 def _base_layout(**kwargs) -> dict:
     return dict(
@@ -49,26 +45,57 @@ def _axis_style() -> dict:
 
 # ── Individual chart builders ─────────────────────────────────────────────────
 
-def _top_categories_chart(df: pd.DataFrame, kpis: dict, n: int = 15) -> go.Figure:
-    """Horizontal bar: top N categories by app count."""
-    by_cat = kpis["by_category"].head(n).sort_values("app_count")
+def _revenue_by_channel(df: pd.DataFrame, kpis: dict) -> go.Figure:
+    by_ch = kpis["by_channel"].sort_values("revenue", ascending=True)
+    total = kpis["total_revenue"] or 1
     hover = [
-        f"<b>{c}</b><br>Apps: {a:,}<br>Avg Rating: {r:.2f}"
-        for c, a, r in zip(by_cat["category"], by_cat["app_count"], by_cat["avg_rating"])
+        f"<b>{ch}</b><br>Revenue: ${rev:,.2f} ({rev/total*100:.1f}%)<br>"
+        f"Orders: {int(ord_)}<br>Conv: {conv:.1f}%"
+        for ch, rev, ord_, conv in zip(
+            by_ch["TrafficSource"], by_ch["revenue"],
+            by_ch["orders"], by_ch["completion_rate"]
+        )
     ]
     fig = go.Figure(go.Bar(
-        x=by_cat["app_count"],
-        y=by_cat["category"],
+        x=by_ch["revenue"],
+        y=by_ch["TrafficSource"],
         orientation="h",
         marker_color=_BLUE,
-        text=by_cat["app_count"],
+        text=by_ch["revenue"].apply(lambda v: f"${v:,.0f}"),
         textposition="outside",
         hovertext=hover,
         hoverinfo="text",
     ))
     fig.update_layout(
-        title="Top Categories by App Count",
-        xaxis=dict(title="Number of Apps", **_axis_style()),
+        title="Revenue by Traffic Source",
+        xaxis=dict(title="Revenue (USD)", **_axis_style()),
+        yaxis=dict(title="", **_axis_style()),
+        height=380,
+        **_base_layout(),
+    )
+    return fig
+
+
+def _revenue_by_country(df: pd.DataFrame, kpis: dict, n: int = 12) -> go.Figure:
+    by_co = kpis["by_country"].head(n).sort_values("revenue", ascending=True)
+    total = kpis["total_revenue"] or 1
+    hover = [
+        f"<b>{co}</b><br>Revenue: ${rev:,.2f} ({rev/total*100:.1f}%)<br>Orders: {int(ord_)}"
+        for co, rev, ord_ in zip(by_co["Country"], by_co["revenue"], by_co["orders"])
+    ]
+    fig = go.Figure(go.Bar(
+        x=by_co["revenue"],
+        y=by_co["Country"],
+        orientation="h",
+        marker_color=_PURPLE,
+        text=by_co["revenue"].apply(lambda v: f"${v:,.0f}"),
+        textposition="outside",
+        hovertext=hover,
+        hoverinfo="text",
+    ))
+    fig.update_layout(
+        title=f"Revenue by Country (Top {n})",
+        xaxis=dict(title="Revenue (USD)", **_axis_style()),
         yaxis=dict(title="", **_axis_style()),
         height=420,
         **_base_layout(),
@@ -76,8 +103,80 @@ def _top_categories_chart(df: pd.DataFrame, kpis: dict, n: int = 15) -> go.Figur
     return fig
 
 
+def _conversion_rate_chart(df: pd.DataFrame, kpis: dict) -> go.Figure:
+    by_ch = kpis["by_channel"].sort_values("completion_rate", ascending=True)
+    avg_conv = kpis["completion_rate"]
+    colors = [
+        _GREEN if r >= avg_conv + 3 else
+        _RED   if r < avg_conv - 3 else
+        _AMBER
+        for r in by_ch["completion_rate"]
+    ]
+    fig = go.Figure(go.Bar(
+        x=by_ch["completion_rate"],
+        y=by_ch["TrafficSource"],
+        orientation="h",
+        marker_color=colors,
+        text=by_ch["completion_rate"].apply(lambda v: f"{v:.1f}%"),
+        textposition="outside",
+        hovertemplate="<b>%{y}</b><br>Conversion: %{x:.1f}%<extra></extra>",
+    ))
+    fig.add_vline(x=avg_conv, line=dict(color=_SLATE, dash="dot", width=1.5))
+    fig.add_annotation(
+        x=avg_conv, y=1.02, yref="paper",
+        text=f"Avg {avg_conv:.1f}%",
+        showarrow=False, font=dict(color=_SLATE, size=10),
+    )
+    fig.update_layout(
+        title="Order Completion Rate by Channel  (green = above avg)",
+        xaxis=dict(title="Completion Rate (%)", range=[0, 110], **_axis_style()),
+        yaxis=dict(title="", **_axis_style()),
+        height=350,
+        **_base_layout(),
+    )
+    return fig
+
+
+def _aov_by_channel(df: pd.DataFrame, kpis: dict) -> go.Figure:
+    by_ch = kpis["by_channel"].copy()
+    mkt_aov = kpis["avg_order_value"]
+    by_ch_sorted = by_ch.sort_values("revenue", ascending=False)
+    # Compute AOV per channel from raw data
+    completed = df[df["is_completed"]]
+    ch_aov = (
+        completed.groupby("TrafficSource")["Total"].mean()
+        .reset_index()
+        .rename(columns={"Total": "aov"})
+    )
+    merged = by_ch_sorted.merge(ch_aov, on="TrafficSource", how="left")
+    merged = merged.sort_values("aov", ascending=True)
+    colors = [
+        _GREEN if v >= mkt_aov + 2 else
+        _RED   if v < mkt_aov - 2 else
+        _AMBER
+        for v in merged["aov"]
+    ]
+    fig = go.Figure(go.Bar(
+        x=merged["aov"],
+        y=merged["TrafficSource"],
+        orientation="h",
+        marker_color=colors,
+        text=merged["aov"].apply(lambda v: f"${v:.2f}"),
+        textposition="outside",
+        hovertemplate="<b>%{y}</b><br>AOV: $%{x:.2f}<extra></extra>",
+    ))
+    fig.add_vline(x=mkt_aov, line=dict(color=_SLATE, dash="dot", width=1.5))
+    fig.update_layout(
+        title=f"Average Order Value by Channel  (market avg ${mkt_aov:.2f})",
+        xaxis=dict(title="AOV (USD)", **_axis_style()),
+        yaxis=dict(title="", **_axis_style()),
+        height=350,
+        **_base_layout(),
+    )
+    return fig
+
+
 def _rating_distribution_chart(df: pd.DataFrame, kpis: dict) -> go.Figure:
-    """Bar chart: rating band distribution."""
     dist = kpis["rating_dist"]
     colors = [_RED, _AMBER, _AMBER, _GREEN, _BLUE, _BLUE]
     fig = go.Figure(go.Bar(
@@ -86,422 +185,344 @@ def _rating_distribution_chart(df: pd.DataFrame, kpis: dict) -> go.Figure:
         marker_color=colors[:len(dist)],
         text=dist["count"].apply(lambda v: f"{v:,}"),
         textposition="outside",
-        hovertemplate="Rating %{x}<br>Apps: %{y:,}<extra></extra>",
+        hovertemplate="Rating %{x}<br>Orders: %{y:,}<extra></extra>",
     ))
     fig.update_layout(
-        title="App Rating Distribution",
+        title="Product Rating Distribution",
         xaxis=dict(title="Rating Band", **_axis_style()),
-        yaxis=dict(title="Number of Apps", **_axis_style()),
+        yaxis=dict(title="Number of Orders", **_axis_style()),
+        height=360,
+        **_base_layout(),
+    )
+    return fig
+
+
+def _ratings_by_channel(df: pd.DataFrame, kpis: dict) -> go.Figure:
+    by_ch = kpis["by_channel"].dropna(subset=["avg_product_rating"]).copy()
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        name="Product Rating",
+        x=by_ch["TrafficSource"],
+        y=by_ch["avg_product_rating"],
+        marker_color=_BLUE,
+        text=by_ch["avg_product_rating"].apply(lambda v: f"{v:.2f}"),
+        textposition="outside",
+    ))
+    fig.add_trace(go.Bar(
+        name="Delivery Rating",
+        x=by_ch["TrafficSource"],
+        y=by_ch["avg_delivery_rating"],
+        marker_color=_GREEN,
+        text=by_ch["avg_delivery_rating"].apply(lambda v: f"{v:.2f}"),
+        textposition="outside",
+    ))
+    fig.update_layout(
+        barmode="group",
+        title="Product vs Delivery Rating by Channel",
+        xaxis=dict(title="", **_axis_style()),
+        yaxis=dict(title="Avg Rating (/5)", range=[0, 5.5], **_axis_style()),
         height=380,
         **_base_layout(),
     )
     return fig
 
 
-def _pricing_breakdown_chart(df: pd.DataFrame, kpis: dict) -> go.Figure:
-    """Pie chart: Free/Freemium vs Paid-only."""
-    pb = kpis["pricing_breakdown"]
-    if pb.empty:
-        return _top_categories_chart(df, kpis)
+def _revenue_trend_chart(df: pd.DataFrame, kpis: dict) -> go.Figure:
+    trend = kpis.get("revenue_trend", pd.DataFrame())
+    if trend.empty or len(trend) < 2:
+        return _revenue_by_channel(df, kpis)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=trend["year_month"],
+        y=trend["revenue"],
+        name="Revenue",
+        mode="lines+markers",
+        line=dict(color=_BLUE, width=2),
+        fill="tozeroy",
+        fillcolor="rgba(37,99,235,0.08)",
+        hovertemplate="Period: %{x}<br>Revenue: $%{y:,.2f}<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=trend["year_month"],
+        y=trend["order_count"],
+        name="Orders",
+        mode="lines",
+        line=dict(color=_GREEN, width=2, dash="dot"),
+        yaxis="y2",
+        hovertemplate="Period: %{x}<br>Orders: %{y:,}<extra></extra>",
+    ))
+    _layout = _base_layout()
+    _layout["legend"] = dict(x=0.01, y=0.99, bgcolor="rgba(0,0,0,0)", bordercolor=_GRID)
+    fig.update_layout(
+        title="Monthly Revenue & Order Volume",
+        xaxis=dict(title="Month", **_axis_style()),
+        yaxis=dict(title="Revenue (USD)", **_axis_style()),
+        yaxis2=dict(title="Order Count", overlaying="y", side="right", **_axis_style()),
+        height=380,
+        **_layout,
+    )
+    return fig
+
+
+def _device_breakdown_chart(df: pd.DataFrame, kpis: dict) -> go.Figure:
+    by_dev = kpis["by_device"]
     fig = go.Figure(go.Pie(
-        labels=pb["pricing_type"],
-        values=pb["app_count"],
+        labels=by_dev["DeviceCategory"],
+        values=by_dev["revenue"],
         hole=0.45,
         marker=dict(colors=[_BLUE, _GREEN, _AMBER]),
         textinfo="percent+label",
-        hovertemplate="<b>%{label}</b><br>Apps: %{value:,}<br>Share: %{percent}<extra></extra>",
+        hovertemplate="<b>%{label}</b><br>Revenue: $%{value:,.2f}<br>Share: %{percent}<extra></extra>",
     ))
     fig.update_layout(
-        title="Pricing Model Breakdown",
-        height=380,
+        title="Revenue by Device Category",
+        height=360,
         **_base_layout(),
     )
     return fig
 
 
-def _top_developers_chart(df: pd.DataFrame, kpis: dict, n: int = 15) -> go.Figure:
-    """Horizontal bar: top N developers by app count."""
-    devs = kpis["by_developer"].head(n).sort_values("app_count")
+def _gender_breakdown_chart(df: pd.DataFrame, kpis: dict) -> go.Figure:
+    by_g = kpis["by_gender"]
+    fig = make_subplots(rows=1, cols=2,
+                        subplot_titles=("Orders by Gender", "Revenue by Gender"))
+    colors = [_BLUE, _PURPLE]
+    fig.add_trace(go.Bar(
+        x=by_g["Gender"], y=by_g["orders"],
+        marker_color=colors,
+        text=by_g["orders"].apply(lambda v: f"{v:,}"),
+        textposition="outside",
+        showlegend=False,
+    ), row=1, col=1)
+    fig.add_trace(go.Bar(
+        x=by_g["Gender"], y=by_g["revenue"],
+        marker_color=colors,
+        text=by_g["revenue"].apply(lambda v: f"${v:,.0f}"),
+        textposition="outside",
+        showlegend=False,
+    ), row=1, col=2)
+    for c in (1, 2):
+        fig.update_xaxes(**_axis_style(), row=1, col=c)
+        fig.update_yaxes(**_axis_style(), row=1, col=c)
+    fig.update_layout(
+        title="Orders & Revenue by Gender",
+        height=360,
+        paper_bgcolor=_BG, plot_bgcolor=_BG,
+        font=dict(family="Inter, sans-serif", color="#1a2744", size=12),
+        margin=dict(l=50, r=30, t=80, b=50),
+    )
+    return fig
+
+
+def _order_status_chart(df: pd.DataFrame, kpis: dict) -> go.Figure:
+    sb = kpis["status_breakdown"]
+    total = kpis["total_orders"] or 1
+    colors_map = {"Completed": _GREEN, "In Process": _AMBER,
+                  "Cancelled": _RED, "Returned": _PURPLE}
+    bar_colors = [colors_map.get(s, _BLUE) for s in sb["status"]]
     hover = [
-        f"<b>{d}</b><br>Apps: {a}<br>Avg Rating: {r:.2f}"
-        for d, a, r in zip(devs["developer"], devs["app_count"], devs["avg_rating"])
+        f"<b>{s}</b><br>Count: {c:,}<br>Share: {c/total*100:.1f}%"
+        for s, c in zip(sb["status"], sb["count"])
     ]
     fig = go.Figure(go.Bar(
-        x=devs["app_count"],
-        y=devs["developer"],
-        orientation="h",
-        marker_color=_PURPLE,
-        text=devs["app_count"],
+        x=sb["status"],
+        y=sb["count"],
+        marker_color=bar_colors,
+        text=sb["count"].apply(lambda v: f"{v:,}"),
         textposition="outside",
         hovertext=hover,
         hoverinfo="text",
     ))
     fig.update_layout(
-        title="Top Developers by App Count",
-        xaxis=dict(title="Number of Apps", **_axis_style()),
-        yaxis=dict(title="", **_axis_style()),
-        height=420,
+        title="Order Status Breakdown",
+        xaxis=dict(title="", **_axis_style()),
+        yaxis=dict(title="Number of Orders", **_axis_style()),
+        height=360,
         **_base_layout(),
     )
     return fig
 
 
-def _category_rating_chart(df: pd.DataFrame, kpis: dict, n: int = 20) -> go.Figure:
-    """Scatter: category avg rating vs app count (bubble size = total reviews)."""
-    by_cat = kpis["by_category"].head(n).dropna(subset=["avg_rating"])
-    max_rev = by_cat["total_reviews"].max() or 1
-    sizes = (by_cat["total_reviews"] / max_rev * 40 + 8).clip(8, 40)
-    fig = go.Figure(go.Scatter(
-        x=by_cat["app_count"],
-        y=by_cat["avg_rating"],
-        mode="markers+text",
-        text=by_cat["category"].apply(lambda s: s[:20] if isinstance(s, str) else ""),
-        textposition="top center",
-        marker=dict(
-            size=sizes,
-            color=by_cat["avg_rating"],
-            colorscale=[[0, _RED], [0.5, _AMBER], [1, _GREEN]],
-            showscale=True,
-            colorbar=dict(title="Avg Rating"),
-        ),
-        hovertemplate="<b>%{text}</b><br>Apps: %{x:,}<br>Rating: %{y:.2f}<extra></extra>",
-    ))
-    fig.update_layout(
-        title="Category: App Count vs Avg Rating (bubble = review volume)",
-        xaxis=dict(title="Number of Apps", **_axis_style()),
-        yaxis=dict(title="Avg Rating", **_axis_style()),
-        height=420,
-        **_base_layout(),
+def _cancellation_analysis_chart(df: pd.DataFrame, kpis: dict) -> go.Figure:
+    """Cancellation rate and count by channel — used for 'why cancelled' questions."""
+    cancelled = df[df["OrderStatus"].str.lower().str.contains("cancel", na=False)]
+    total_by_ch = df.groupby("TrafficSource")["InvoiceNumber"].count().reset_index()
+    total_by_ch.columns = ["TrafficSource", "total"]
+    cancel_by_ch = cancelled.groupby("TrafficSource")["InvoiceNumber"].count().reset_index()
+    cancel_by_ch.columns = ["TrafficSource", "cancelled"]
+    merged = total_by_ch.merge(cancel_by_ch, on="TrafficSource", how="left").fillna(0)
+    merged["cancel_rate"] = (merged["cancelled"] / merged["total"] * 100).round(1)
+    merged = merged.sort_values("cancel_rate", ascending=True)
+
+    avg_rate = float(cancelled.__len__() / len(df) * 100) if len(df) else 0
+    colors = [
+        _RED   if r > avg_rate + 2 else
+        _AMBER if r > avg_rate - 2 else
+        _GREEN
+        for r in merged["cancel_rate"]
+    ]
+
+    from plotly.subplots import make_subplots
+    fig = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=("Cancellation Rate by Channel (%)", "Cancelled Orders Count"),
+        horizontal_spacing=0.12,
     )
-    return fig
+    fig.add_trace(go.Bar(
+        x=merged["cancel_rate"], y=merged["TrafficSource"],
+        orientation="h", marker_color=colors,
+        text=merged["cancel_rate"].apply(lambda v: f"{v:.1f}%"),
+        textposition="outside",
+        hovertemplate="<b>%{y}</b><br>Cancel Rate: %{x:.1f}%<extra></extra>",
+        showlegend=False,
+    ), row=1, col=1)
+    fig.add_trace(go.Bar(
+        x=merged["cancelled"], y=merged["TrafficSource"],
+        orientation="h", marker_color=_SLATE,
+        text=merged["cancelled"].apply(lambda v: f"{int(v)}"),
+        textposition="outside",
+        hovertemplate="<b>%{y}</b><br>Cancelled: %{x:,}<extra></extra>",
+        showlegend=False,
+    ), row=1, col=2)
 
-
-def _review_trend_chart(df: pd.DataFrame, kpis: dict) -> go.Figure:
-    """Line chart: monthly review volume over time."""
-    trend = kpis.get("review_trend", pd.DataFrame())
-    if trend.empty or len(trend) < 2:
-        return _top_categories_chart(df, kpis)
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=trend["year_month"],
-        y=trend["review_count"],
-        name="Reviews",
-        mode="lines+markers",
-        line=dict(color=_BLUE, width=2),
-        fill="tozeroy",
-        fillcolor="rgba(37,99,235,0.08)",
-        hovertemplate="Period: %{x}<br>Reviews: %{y:,}<extra></extra>",
-    ))
-    fig.add_trace(go.Scatter(
-        x=trend["year_month"],
-        y=trend["avg_rating"],
-        name="Avg Rating",
-        mode="lines",
-        line=dict(color=_GREEN, width=2, dash="dot"),
-        yaxis="y2",
-        hovertemplate="Period: %{x}<br>Avg Rating: %{y:.2f}<extra></extra>",
-    ))
+    fig.add_vline(x=avg_rate, row=1, col=1,
+                  line=dict(color=_RED, dash="dot", width=1.5))
+    _layout = _base_layout()
     fig.update_layout(
-        title="Review Volume & Avg Rating Over Time",
-        xaxis=dict(title="Month", **_axis_style()),
-        yaxis=dict(title="Review Count", **_axis_style()),
-        yaxis2=dict(
-            title="Avg Rating", overlaying="y", side="right",
-            range=[0, 5.5], **_axis_style()
-        ),
+        title=f"Cancellation Analysis by Channel  (avg rate: {avg_rate:.1f}%)",
         height=380,
-        **_base_layout(),
+        **_layout,
     )
-    fig.update_layout(legend=dict(x=0.01, y=0.99))
+    fig.update_xaxes(**_axis_style())
+    fig.update_yaxes(**_axis_style())
     return fig
 
 
-def _apps_rating_scatter(df: pd.DataFrame, kpis: dict, n: int = 500) -> go.Figure:
-    """Scatter: individual apps — reviews_count vs rating, colored by pricing."""
-    sample = df.dropna(subset=["rating", "reviews_count"]).head(n)
-    color_map = {"Free / Freemium": _BLUE, "Paid only": _AMBER, "Unknown": _SLATE}
+def _channel_deep_dive_chart(df: pd.DataFrame, kpis: dict, channel: str) -> go.Figure:
+    ch_df = df[df["TrafficSource"].str.contains(channel, case=False, na=False)]
+    if ch_df.empty:
+        return _revenue_by_channel(df, kpis)
 
-    fig = go.Figure()
-    for ptype, group in sample.groupby("pricing_type"):
-        fig.add_trace(go.Scatter(
-            x=group["reviews_count"],
-            y=group["rating"],
-            mode="markers",
-            name=ptype,
-            marker=dict(color=color_map.get(str(ptype), _SLATE), size=6, opacity=0.65),
-            hovertemplate=(
-                "<b>%{customdata[0]}</b><br>"
-                "Dev: %{customdata[1]}<br>"
-                "Reviews: %{x:,}<br>Rating: %{y:.2f}<extra></extra>"
-            ),
-            customdata=group[["title", "developer"]].values,
-        ))
-    fig.update_layout(
-        title="Apps: Rating vs Review Count",
-        xaxis=dict(title="Review Count", **_axis_style()),
-        yaxis=dict(title="Rating", **_axis_style()),
-        height=420,
-        **_base_layout(),
+    by_co = (
+        ch_df.groupby("Country")
+        .agg(orders=("InvoiceNumber", "count"), revenue=("revenue", "sum"))
+        .sort_values("revenue", ascending=False)
+        .head(10)
+        .sort_values("revenue", ascending=True)
+        .reset_index()
     )
-    return fig
-
-
-def _free_vs_paid_by_category(df: pd.DataFrame, kpis: dict, n: int = 12) -> go.Figure:
-    """Stacked bar: free vs paid app count per top category."""
-    by_cat = kpis["by_category"].head(n)
-    free_counts = (by_cat["app_count"] * by_cat["pct_free"] / 100).round().astype(int)
-    paid_counts = by_cat["app_count"] - free_counts
-    fig = go.Figure()
-    fig.add_trace(go.Bar(
-        name="Free / Freemium",
-        x=by_cat["category"],
-        y=free_counts,
-        marker_color=_BLUE,
-    ))
-    fig.add_trace(go.Bar(
-        name="Paid only",
-        x=by_cat["category"],
-        y=paid_counts,
-        marker_color=_AMBER,
-    ))
-    fig.update_layout(
-        barmode="stack",
-        title="Free vs Paid Apps by Category",
-        xaxis=dict(title="", tickangle=-35, **_axis_style()),
-        yaxis=dict(title="Number of Apps", **_axis_style()),
-        height=400,
-        **_base_layout(),
-    )
-    return fig
-
-
-# ── Category deep-dive chart ─────────────────────────────────────────────────
-
-def _category_detail_chart(df: pd.DataFrame, kpis: dict, category_name: str) -> go.Figure:
-    """
-    Top apps in a specific category by review count, bars colored by rating.
-    Fully dynamic — title and data built from category_name at runtime.
-    """
-    # Filter apps to this category — proper column check avoids the df.get()
-    # anti-pattern (a length-0 pd.DataFrame() fallback has a different Pyright
-    # inferred type than a filtered slice of df, causing overload errors downstream).
-    # df.iloc[0:0] gives an empty DataFrame with the same schema as df.
-    if "primary_category" in df.columns:
-        cat_df = df[df["primary_category"] == category_name]
-    else:
-        cat_df = df.iloc[0:0]  # empty, same columns/dtypes as df
-
-    if cat_df.empty and "categories" in df.columns:
-        cat_df = df[df["categories"].str.contains(category_name, case=False, na=False)]
-
-    if cat_df.empty:
-        return _top_categories_chart(df, kpis)
-
-    _mask = cat_df["reviews_count"].notna() & cat_df["rating"].notna()
-    top   = cat_df[_mask].sort_values("reviews_count", ascending=False).head(15)
-
-    # Color each bar by its rating relative to category median (data-driven)
-    median_rating = top["rating"].median()
-    bar_colors = [
-        _GREEN if r >= median_rating + 0.3 else
-        _RED   if r < median_rating - 0.3 else
-        _AMBER
-        for r in top["rating"]
-    ]
-
     hover = [
-        f"<b>{t}</b><br>Dev: {d}<br>Reviews: {rv:,}<br>Rating: {r:.1f}<br>{pt}"
-        for t, d, rv, r, pt in zip(
-            top["title"], top["developer"],
-            top["reviews_count"], top["rating"],
-            top.get("pricing_type", [""] * len(top))
-        )
+        f"<b>{co}</b><br>Revenue: ${rev:,.2f}<br>Orders: {int(ord_)}"
+        for co, rev, ord_ in zip(by_co["Country"], by_co["revenue"], by_co["orders"])
     ]
-
     fig = go.Figure(go.Bar(
-        x=top["reviews_count"],
-        y=top["title"].apply(lambda s: s[:35] if isinstance(s, str) else s),
+        x=by_co["revenue"],
+        y=by_co["Country"],
         orientation="h",
-        marker_color=bar_colors,
-        text=top["rating"].apply(lambda r: f"★{r:.1f}"),
-        textposition="inside",
+        marker_color=_BLUE,
+        text=by_co["revenue"].apply(lambda v: f"${v:,.0f}"),
+        textposition="outside",
         hovertext=hover,
         hoverinfo="text",
     ))
-
-    store_avg  = kpis["avg_rating"]
-    cat_row    = kpis["by_category"][kpis["by_category"]["category"] == category_name]
-    cat_avg    = cat_row.iloc[0]["avg_rating"] if not cat_row.empty else store_avg
-    n_apps     = cat_row.iloc[0]["app_count"]  if not cat_row.empty else len(cat_df)
-
+    ch_rev  = float(ch_df["revenue"].sum())
+    ch_ord  = len(ch_df)
+    comp    = ch_df[ch_df["is_completed"]]
+    ch_rate = len(comp) / ch_ord * 100 if ch_ord else 0
     fig.update_layout(
-        title=f"Top Apps in '{category_name}'  ({n_apps:,} apps · avg rating {cat_avg:.2f} vs store {store_avg:.2f})",
-        xaxis=dict(title="Review Count", **_axis_style()),
+        title=f"{channel}  —  ${ch_rev:,.0f} revenue · {ch_ord:,} orders · {ch_rate:.1f}% conv",
+        xaxis=dict(title="Revenue (USD)", **_axis_style()),
         yaxis=dict(title="", **_axis_style()),
-        height=450,
+        height=420,
         **_base_layout(),
     )
     return fig
 
 
-# ── Opportunity / saturation map ─────────────────────────────────────────────
+def _country_deep_dive_chart(df: pd.DataFrame, kpis: dict, country: str) -> go.Figure:
+    co_df = df[df["Country"].str.contains(country, case=False, na=False)]
+    if co_df.empty:
+        return _revenue_by_country(df, kpis)
 
-def _opportunities_chart(df: pd.DataFrame, kpis: dict) -> go.Figure:
-    """
-    Scatter of all categories: x=app_count, y=avg_rating.
-    Quadrant boundaries derived from data percentiles — no hardcoded values.
-    Annotates opportunity and saturated zones.
-    """
-    # Read pre-computed signals from kpis (computed once in compute_kpis).
-    # Falls back to recomputing only if kpis was built without it.
-    by_cat  = kpis["by_category"].dropna(subset=["avg_rating"])
-    signals = kpis.get("opportunity_signals") or get_opportunity_signals(kpis)
-    th      = signals["thresholds"]
-
-    p25_count  = th.get("p25_count", by_cat["app_count"].quantile(0.25))
-    p75_count  = th.get("p75_count", by_cat["app_count"].quantile(0.75))
-    p25_rating = th.get("p25_rating", by_cat["avg_rating"].quantile(0.25))
-    p75_rating = th.get("p75_rating", by_cat["avg_rating"].quantile(0.75))
-
-    under_set = set(signals["under_served"]["category"].tolist())
-    over_set  = set(signals["over_saturated"]["category"].tolist())
-
-    def _quadrant_color(row):
-        if row["category"] in under_set:
-            return _GREEN
-        if row["category"] in over_set:
-            return _RED
-        return _BLUE
-
-    colors = by_cat.apply(_quadrant_color, axis=1).tolist()
-    labels = by_cat["category"].apply(lambda s: s[:18] if isinstance(s, str) else "")
-
-    fig = go.Figure(go.Scatter(
-        x=by_cat["app_count"],
-        y=by_cat["avg_rating"],
-        mode="markers+text",
-        text=labels,
-        textposition="top center",
-        textfont=dict(size=8),
-        marker=dict(
-            color=colors,
-            size=by_cat["total_reviews"].apply(
-                lambda v: max(6, min(30, v / by_cat["total_reviews"].max() * 30))
-            ),
-            opacity=0.75,
-        ),
-        hovertemplate=(
-            "<b>%{text}</b><br>"
-            "Apps: %{x:,}<br>"
-            "Avg Rating: %{y:.2f}<br>"
-            "<extra></extra>"
-        ),
+    ch_mix = (
+        co_df.groupby("TrafficSource")
+        .agg(orders=("InvoiceNumber", "count"), revenue=("revenue", "sum"))
+        .sort_values("revenue", ascending=True)
+        .reset_index()
+    )
+    fig = go.Figure(go.Bar(
+        x=ch_mix["revenue"],
+        y=ch_mix["TrafficSource"],
+        orientation="h",
+        marker_color=_PURPLE,
+        text=ch_mix["revenue"].apply(lambda v: f"${v:,.0f}"),
+        textposition="outside",
+        hovertemplate="<b>%{y}</b><br>Revenue: $%{x:,.2f}<extra></extra>",
     ))
-
-    # Quadrant reference lines (data-driven)
-    fig.add_vline(x=p25_count,  line=dict(color=_SLATE, dash="dot", width=1))
-    fig.add_vline(x=p75_count,  line=dict(color=_SLATE, dash="dot", width=1))
-    fig.add_hline(y=p25_rating, line=dict(color=_SLATE, dash="dot", width=1))
-    fig.add_hline(y=p75_rating, line=dict(color=_SLATE, dash="dot", width=1))
-
-    # Zone annotations
-    x_max = float(by_cat["app_count"].max()) * 0.95
-    fig.add_annotation(x=p25_count * 0.5, y=p75_rating + 0.05,
-                       text="Opportunity Zone", showarrow=False,
-                       font=dict(color=_GREEN, size=10, family="Inter"))
-    fig.add_annotation(x=x_max, y=p25_rating - 0.05,
-                       text="Saturated Zone", showarrow=False,
-                       font=dict(color=_RED, size=10, family="Inter"))
-
+    co_rev = float(co_df["revenue"].sum())
+    co_ord = len(co_df)
     fig.update_layout(
-        title=(
-            f"Market Map: App Count vs Avg Rating  "
-            f"(thresholds: count p25={p25_count:.0f}/p75={p75_count:.0f}, "
-            f"rating p25={p25_rating:.2f}/p75={p75_rating:.2f})"
-        ),
-        xaxis=dict(title="Number of Apps in Category", **_axis_style()),
-        yaxis=dict(title="Avg Rating", **_axis_style()),
-        height=480,
+        title=f"{country}  —  ${co_rev:,.0f} revenue · {co_ord:,} orders",
+        xaxis=dict(title="Revenue (USD)", **_axis_style()),
+        yaxis=dict(title="Channel", **_axis_style()),
+        height=360,
         **_base_layout(),
     )
     return fig
 
 
-# ── Side-by-side category comparison ─────────────────────────────────────────
-
-def _compare_categories_chart(
-    df: pd.DataFrame, kpis: dict, cat1: str, cat2: str
-) -> go.Figure:
-    """
-    2×2 subplot comparing two categories across four key metrics:
-    App Count, Avg Rating, Total Reviews, % Free.
-    Each subplot has its own y-axis scale so no metric is squashed.
-    """
-    by_cat = kpis["by_category"]
-    rows: dict = {}
-    for cat in [cat1, cat2]:
-        row = by_cat[by_cat["category"] == cat]
-        if not row.empty:
-            rows[cat] = row.iloc[0]
+def _compare_channels_chart(df: pd.DataFrame, kpis: dict, ch1: str, ch2: str) -> go.Figure:
+    by_ch = kpis["by_channel"]
+    rows = {}
+    for ch in [ch1, ch2]:
+        r = by_ch[by_ch["TrafficSource"].str.lower() == ch.lower()]
+        if not r.empty:
+            rows[ch] = r.iloc[0]
 
     if len(rows) < 2:
-        return _top_categories_chart(df, kpis)
+        return _revenue_by_channel(df, kpis)
 
-    r1, r2 = rows[cat1], rows[cat2]
-    labels = [cat1[:25], cat2[:25]]
+    r1, r2 = rows[ch1], rows[ch2]
+    labels = [ch1[:20], ch2[:20]]
     colors = [_BLUE, _GREEN]
+
+    # Compute per-channel AOV
+    completed = df[df["is_completed"]]
+    aov = completed.groupby("TrafficSource")["Total"].mean()
+    aov1 = float(aov.get(ch1, 0))
+    aov2 = float(aov.get(ch2, 0))
 
     fig = make_subplots(
         rows=2, cols=2,
-        subplot_titles=("App Count", "Avg Rating (/5)", "Total Reviews", "% Free Apps"),
-        vertical_spacing=0.18,
-        horizontal_spacing=0.12,
+        subplot_titles=("Revenue (USD)", "Conversion Rate (%)", "Avg Order Value ($)", "Avg Product Rating"),
+        vertical_spacing=0.18, horizontal_spacing=0.12,
     )
 
-    def _bar(vals: list, texts: list) -> go.Bar:
-        return go.Bar(
-            x=labels, y=vals,
-            marker_color=colors,
-            text=texts, textposition="outside",
-            showlegend=False,
-        )
+    def _bar(vals, texts):
+        return go.Bar(x=labels, y=vals, marker_color=colors,
+                      text=texts, textposition="outside", showlegend=False)
 
-    fig.add_trace(_bar(
-        [int(r1["app_count"]),   int(r2["app_count"])],
-        [f"{r1['app_count']:,}", f"{r2['app_count']:,}"],
-    ), row=1, col=1)
+    fig.add_trace(_bar([r1["revenue"], r2["revenue"]],
+                       [f"${r1['revenue']:,.0f}", f"${r2['revenue']:,.0f}"]), row=1, col=1)
+    fig.add_trace(_bar([r1["completion_rate"], r2["completion_rate"]],
+                       [f"{r1['completion_rate']:.1f}%", f"{r2['completion_rate']:.1f}%"]), row=1, col=2)
+    fig.add_trace(_bar([aov1, aov2],
+                       [f"${aov1:.2f}", f"${aov2:.2f}"]), row=2, col=1)
+    fig.add_trace(_bar([r1["avg_product_rating"], r2["avg_product_rating"]],
+                       [f"{r1['avg_product_rating']:.2f}", f"{r2['avg_product_rating']:.2f}"]), row=2, col=2)
 
-    fig.add_trace(_bar(
-        [float(r1["avg_rating"]),     float(r2["avg_rating"])],
-        [f"{r1['avg_rating']:.2f}",   f"{r2['avg_rating']:.2f}"],
-    ), row=1, col=2)
-
-    fig.add_trace(_bar(
-        [int(r1["total_reviews"]),   int(r2["total_reviews"])],
-        [f"{r1['total_reviews']:,}", f"{r2['total_reviews']:,}"],
-    ), row=2, col=1)
-
-    fig.add_trace(_bar(
-        [float(r1["pct_free"]),      float(r2["pct_free"])],
-        [f"{r1['pct_free']:.1f}%",   f"{r2['pct_free']:.1f}%"],
-    ), row=2, col=2)
-
-    # Pin sensible y-axis ranges
-    fig.update_yaxes(range=[0, 5.5],  row=1, col=2)   # rating
-    fig.update_yaxes(range=[0, 105],  row=2, col=2)   # % free
-
-    # Apply axis style to all subplots
+    fig.update_yaxes(range=[0, 5.5], row=2, col=2)
+    fig.update_yaxes(range=[0, 110], row=1, col=2)
     for r in (1, 2):
         for c in (1, 2):
             fig.update_xaxes(**_axis_style(), row=r, col=c)
             fig.update_yaxes(**_axis_style(), row=r, col=c)
 
     fig.update_layout(
-        title=f"Category Comparison: {cat1}  vs  {cat2}",
+        title=f"Channel Comparison: {ch1}  vs  {ch2}",
         height=480,
-        paper_bgcolor=_BG,
-        plot_bgcolor=_BG,
+        paper_bgcolor=_BG, plot_bgcolor=_BG,
         font=dict(family="Inter, sans-serif", color="#1a2744", size=12),
         margin=dict(l=50, r=30, t=80, b=50),
         showlegend=False,
@@ -509,142 +530,285 @@ def _compare_categories_chart(
     return fig
 
 
-# ── Overview (default landing) chart ─────────────────────────────────────────
+# ── Default overview chart ─────────────────────────────────────────────────────
 
 def overview_chart(df: pd.DataFrame, kpis: dict) -> go.Figure:
-    """Default chart shown before the user asks anything."""
-    return _top_categories_chart(df, kpis)
+    return _revenue_by_channel(df, kpis)
 
 
 # ── Keyword-routing auto-chart ────────────────────────────────────────────────
+
+_THEORY_PREFIXES = (
+    "what is ", "what are the definition", "how does ", "how do ",
+    "explain ", "why is ", "why are ", "why does ", "can you explain",
+    "what does it mean", "tell me what", "what does",
+    "hello", "hi ", "hey ", "thanks", "thank you",
+)
+
 
 def auto_chart(
     question: str,
     df: pd.DataFrame,
     kpis: dict,
     entities: dict | None = None,
-) -> go.Figure:
-    """
-    Map a natural-language question to the most relevant chart.
-
-    entities: pre-computed result from entity_extractor.extract_entities().
-    If provided, uses it directly; otherwise falls back to keyword routing.
-    """
-    q = question.lower()
+) -> "go.Figure | None":
+    q    = question.lower().strip()
     ents = entities if entities is not None else _extract_entities(question, kpis)
 
-    # ── 1a. Two categories detected → side-by-side comparison chart ─────────
-    if ents.get("category") and ents.get("category2"):
-        return _compare_categories_chart(df, kpis, ents["category"], ents["category2"])
+    # ── 0. Theory / greeting ─────────────────────────────────────────────────
+    if any(q.startswith(p) for p in _THEORY_PREFIXES):
+        return None
 
-    # ── 1b. Single category detected → category deep-dive chart ─────────────
-    if ents.get("category"):
-        return _category_detail_chart(df, kpis, ents["category"])
+    # ── 1. Two channels → comparison ─────────────────────────────────────────
+    if ents.get("channel") and ents.get("channel2"):
+        return _compare_channels_chart(df, kpis, ents["channel"], ents["channel2"])
 
-    # ── 2. Opportunity / saturation questions ────────────────────────────────
-    if any(w in q for w in ["opportunit", "underserved", "where should", "gap",
-                             "saturated", "market map", "which category to",
-                             "where to build", "where to enter"]):
-        return _opportunities_chart(df, kpis)
+    # ── 2. Single channel + intent routing ───────────────────────────────────
+    if ents.get("channel"):
+        ch = ents["channel"]
+        if any(w in q for w in ["conversion", "completion", "conv rate"]):
+            return _conversion_rate_chart(df, kpis)
+        if any(w in q for w in ["aov", "order value", "average order"]):
+            return _aov_by_channel(df, kpis)
+        if any(w in q for w in ["rating", "quality", "satisfaction"]):
+            return _ratings_by_channel(df, kpis)
+        if any(w in q for w in ["trend", "over time", "monthly", "month"]):
+            return _revenue_trend_chart(df, kpis)
+        return _channel_deep_dive_chart(df, kpis, ch)
 
-    # ── 3. Standard keyword routing (unchanged) ──────────────────────────────
-    if any(w in q for w in ["trend", "time", "month", "year", "history",
-                             "grow", "over time", "timeline"]):
-        return _review_trend_chart(df, kpis)
+    # ── 3. Country ────────────────────────────────────────────────────────────
+    if ents.get("country"):
+        return _country_deep_dive_chart(df, kpis, ents["country"])
 
-    if any(w in q for w in ["developer", "partner", "vendor", "publisher",
-                             "maker", "built by"]):
-        return _top_developers_chart(df, kpis)
+    # ── 4. Keyword routing ────────────────────────────────────────────────────
 
-    if any(w in q for w in ["scatter", "correlation", "compare apps",
-                             "vs review", "versus"]):
-        return _apps_rating_scatter(df, kpis)
+    if any(w in q for w in ["trend", "over time", "monthly", "month", "grow", "decline", "yoy"]):
+        return _revenue_trend_chart(df, kpis)
 
-    if any(w in q for w in ["rating", "score", "stars", "rated", "distribution"]):
-        if any(w in q for w in ["category", "categories", "type", "segment"]):
-            return _category_rating_chart(df, kpis)
+    if any(w in q for w in ["conversion", "completion rate", "completion", "conv rate", "order status"]):
+        if any(w in q for w in ["channel", "source", "traffic"]):
+            return _conversion_rate_chart(df, kpis)
+        return _order_status_chart(df, kpis)
+
+    # Cancellation analysis: questions about WHY/WHERE orders are cancelled
+    # → show cancellation rate by channel (more actionable than simple status count)
+    if any(w in q for w in ["cancel", "cancelled", "cancellation", "cancellations"]):
+        if any(w in q for w in ["why", "reason", "cause", "analysis", "analyse", "analyze",
+                                 "driver", "factor", "pattern", "channel", "source"]):
+            return _cancellation_analysis_chart(df, kpis)
+        return _order_status_chart(df, kpis)
+
+    if any(w in q for w in ["status", "in process", "breakdown"]):
+        return _order_status_chart(df, kpis)
+
+    if any(w in q for w in ["aov", "order value", "average order value"]):
+        return _aov_by_channel(df, kpis)
+
+    if any(w in q for w in ["rating", "quality", "satisfaction", "delivery rating", "product rating"]):
+        if any(w in q for w in ["channel", "source", "traffic"]):
+            return _ratings_by_channel(df, kpis)
         return _rating_distribution_chart(df, kpis)
 
-    if any(w in q for w in ["price", "pricing", "free", "paid", "freemium",
-                             "plan", "cost", "subscription", "monetiz"]):
-        if any(w in q for w in ["category", "categories", "segment"]):
-            return _free_vs_paid_by_category(df, kpis)
-        return _pricing_breakdown_chart(df, kpis)
+    if any(w in q for w in ["channel", "traffic source", "source", "acquisition"]):
+        if any(w in q for w in ["revenue", "sales", "money"]):
+            return _revenue_by_channel(df, kpis)
+        if any(w in q for w in ["conversion", "completion"]):
+            return _conversion_rate_chart(df, kpis)
+        return _revenue_by_channel(df, kpis)
 
-    if any(w in q for w in ["review", "feedback", "comment",
-                             "user opinion", "sentiment"]):
-        return _review_trend_chart(df, kpis)
+    if any(w in q for w in ["country", "countries", "geography", "region", "market"]):
+        return _revenue_by_country(df, kpis)
 
-    if any(w in q for w in ["category", "categories", "segment", "top",
-                             "popular", "market", "niche"]):
-        return _top_categories_chart(df, kpis)
+    if any(w in q for w in ["device", "mobile", "computer", "desktop", "laptop"]):
+        return _device_breakdown_chart(df, kpis)
 
-    # default
-    return _top_categories_chart(df, kpis)
+    if any(w in q for w in ["gender", "male", "female", "men", "women"]):
+        return _gender_breakdown_chart(df, kpis)
+
+    if any(w in q for w in ["revenue", "sales", "income", "earning"]):
+        if any(w in q for w in ["country", "countries", "geography"]):
+            return _revenue_by_country(df, kpis)
+        if any(w in q for w in ["channel", "source"]):
+            return _revenue_by_channel(df, kpis)
+        return _revenue_trend_chart(df, kpis)
+
+    if any(w in q for w in ["overview", "summary", "overall", "health", "kpi"]):
+        return _revenue_by_channel(df, kpis)
+
+    return None
 
 
-# ── Sidebar metric tree (sunburst) ────────────────────────────────────────────
+# ── Sidebar metric tree ────────────────────────────────────────────────────────
 
-def metric_tree_chart(df: pd.DataFrame, kpis: dict) -> go.Figure:
+def metric_tree_chart(df: pd.DataFrame, kpis: dict, expanded: str | None = None) -> go.Figure:
     """
-    Sunburst: root = total apps, level-1 = top categories,
-    level-2 = Free / Paid split.  Color intensity = avg rating.
+    Interactive tree: root → 4 pillar nodes.
+    Pass expanded='rev'|'ord'|'qual'|'geo' to show leaf metrics.
+    Pillar customdata IDs are used by app.py to detect clicks via on_select.
     """
-    by_cat = kpis["by_category"].head(10)
+    yoy     = kpis.get("yoy_stats", {})
+    rev_yoy = yoy.get("rev_yoy_pct")
+    rev_yoy_str = f"{rev_yoy:+.1f}%" if rev_yoy is not None else "N/A"
+    pct_completed = kpis["completion_rate"]
 
-    ids, labels, parents, values, colors = [], [], [], [], []
+    def _color(score: float) -> str:
+        if score >= 4.0:   return "#16a34a"
+        if score >= 3.0:   return "#d97706"
+        return "#dc2626"
 
-    ids.append("root")
-    labels.append(f"All Apps")
-    parents.append("")
-    values.append(kpis["total_apps"])
-    colors.append(kpis["avg_rating"])
+    ROOT_X, ROOT_Y = 0.50, 0.88
+    PILLAR_Y       = 0.54
+    LEAF_Y         = 0.10
 
-    for _, row in by_cat.iterrows():
-        cat = str(row["category"])
-        cat_id = f"cat_{cat}"
-        ids.append(cat_id)
-        labels.append(f"{cat[:15]}")
-        parents.append("root")
-        values.append(int(row["app_count"]))
-        colors.append(float(row["avg_rating"]))
+    pillars = [
+        ("rev",  "Revenue\nGrowth",   "Revenue Growth",   0.125,
+         4.0 if (rev_yoy or 0) >= 0 else 2.5),
+        ("ord",  "Order\nQuality",    "Order Quality",    0.375,
+         4.0 if pct_completed >= 70 else (3.0 if pct_completed >= 50 else 2.0)),
+        ("qual", "Customer\nQuality", "Customer Quality", 0.625,
+         kpis["avg_product_rating"]),
+        ("geo",  "Geo\nReach",        "Geographic Reach", 0.875, 3.8),
+    ]
 
-        free_n = max(1, round(row["app_count"] * row["pct_free"] / 100))
-        paid_n = max(0, int(row["app_count"]) - free_n)
+    # Build channel leaves: top 3 channels, clickable, customdata = "ch:<name>"
+    _by_ch = kpis.get("by_channel", pd.DataFrame())
+    _rev_xpos = [0.03, 0.125, 0.22]
+    _rev_leaves: list[tuple] = []
+    for _i, (_, _row) in enumerate(_by_ch.head(3).iterrows()):
+        _ch = _row["TrafficSource"]
+        _ltv = _row.get("avg_ltv", None)
+        _ltv_str = f" | LTV:${_ltv:.0f}" if _ltv and pd.notna(_ltv) else ""
+        _rev_leaves.append((
+            f"{_ch[:9]}\n${_row['revenue']/1000:.0f}k",
+            f"{_ch} | Rev:${_row['revenue']:,.0f} | Conv:{_row['completion_rate']:.1f}%{_ltv_str}",
+            _rev_xpos[_i],
+            4.0 if _row["completion_rate"] >= 60 else 3.0,
+            f"ch:{_ch}",
+        ))
 
-        ids.append(f"{cat_id}_free")
-        labels.append("Free")
-        parents.append(cat_id)
-        values.append(free_n)
-        colors.append(min(5.0, float(row["avg_rating"]) + 0.05))
+    # Build country leaves: top 3 countries, clickable, customdata = "co:<name>"
+    _by_co = kpis.get("by_country", pd.DataFrame())
+    _geo_xpos = [0.78, 0.875, 0.97]
+    _geo_leaves: list[tuple] = []
+    for _i, (_, _row) in enumerate(_by_co.head(3).iterrows()):
+        _co = _row["Country"]
+        _geo_leaves.append((
+            f"{_co[:10]}\n${_row['revenue']/1000:.0f}k",
+            f"{_co} | Rev:${_row['revenue']:,.0f} | Orders:{int(_row['orders']):,}",
+            _geo_xpos[_i],
+            4.0,
+            f"co:{_co}",
+        ))
 
-        if paid_n:
-            ids.append(f"{cat_id}_paid")
-            labels.append("Paid")
-            parents.append(cat_id)
-            values.append(paid_n)
-            colors.append(max(0.0, float(row["avg_rating"]) - 0.05))
+    _freq = kpis.get("avg_purchase_freq", 1.0)
+    _ret  = kpis.get("retention_rate", 0)
+    leaf_data: dict[str, list[tuple]] = {
+        "rev": _rev_leaves,
+        "ord": [
+            (f"{kpis['completion_rate']:.0f}%\nconv",
+             f"Completion Rate: {kpis['completion_rate']:.1f}%", 0.29,
+             4.0 if pct_completed >= 70 else 2.5, None),
+            (f"{kpis['total_orders']:,}\norders",
+             f"Total Orders: {kpis['total_orders']:,}", 0.375, 4.0, None),
+            (f"{_freq:.2f}x\nfreq",
+             f"Avg Purchase Frequency: {_freq:.2f} orders/customer", 0.46,
+             4.0 if _freq >= 2.0 else (3.0 if _freq >= 1.5 else 2.5), None),
+        ],
+        "qual": [
+            (f"{kpis['avg_product_rating']:.2f}★\nproduct",
+             f"Avg Product Rating: {kpis['avg_product_rating']:.2f}/5", 0.54,
+             kpis["avg_product_rating"], None),
+            (f"{kpis['avg_delivery_rating']:.2f}★\ndelivery",
+             f"Avg Delivery Rating: {kpis['avg_delivery_rating']:.2f}/5", 0.625,
+             kpis["avg_delivery_rating"], None),
+            (f"{_ret:.0f}%\nrepeat",
+             f"Repeat Purchase Rate: {_ret:.1f}%  ({kpis.get('repeat_customers', 0):,} repeat buyers)",
+             0.71,
+             4.0 if _ret >= 30 else (3.0 if _ret >= 15 else 2.0), None),
+        ],
+        "geo": _geo_leaves,
+    }
 
-    fig = go.Figure(go.Sunburst(
-        ids=ids,
-        labels=labels,
-        parents=parents,
-        values=values,
-        marker=dict(
-            colors=colors,
-            colorscale=[[0, "#dc2626"], [0.5, "#d97706"], [1, "#16a34a"]],
-            cmin=0,
-            cmax=5,
-            showscale=False,
-        ),
-        branchvalues="total",
-        textfont=dict(size=9),
-        hovertemplate="<b>%{label}</b><br>Apps: %{value:,}<extra></extra>",
+    fig = go.Figure()
+
+    # Root → pillar edges
+    ex, ey = [], []
+    for pid, _, _, px, _ in pillars:
+        ex += [ROOT_X, px, None]
+        ey += [ROOT_Y, PILLAR_Y, None]
+    fig.add_trace(go.Scatter(x=ex, y=ey, mode="lines",
+                             line=dict(color="#9ca3af", width=1.5),
+                             hoverinfo="skip", showlegend=False))
+
+    # Pillar → leaf edges
+    if expanded and expanded in leaf_data:
+        pillar_x = next(p[3] for p in pillars if p[0] == expanded)
+        lex, ley = [], []
+        for leaf in leaf_data[expanded]:
+            lex += [pillar_x, leaf[2], None]
+            ley += [PILLAR_Y, LEAF_Y, None]
+        fig.add_trace(go.Scatter(x=lex, y=ley, mode="lines",
+                                 line=dict(color="#6b7280", width=1.2, dash="dot"),
+                                 hoverinfo="skip", showlegend=False))
+
+        leaves = leaf_data[expanded]
+        _has_click = any(leaf[4] is not None for leaf in leaves)
+        fig.add_trace(go.Scatter(
+            x=[leaf[2] for leaf in leaves], y=[LEAF_Y] * len(leaves),
+            mode="markers+text",
+            marker=dict(size=44, color=[_color(leaf[3]) for leaf in leaves],
+                        line=dict(color=["#facc15" if leaf[4] else "white" for leaf in leaves],
+                                  width=[2.5 if leaf[4] else 1.5 for leaf in leaves])),
+            text=[leaf[0] for leaf in leaves],
+            textfont=dict(size=7, color="white"),
+            textposition="middle center",
+            customdata=[leaf[4] for leaf in leaves],   # click ID: "ch:X", "co:X", or None
+            hovertext=[leaf[1] for leaf in leaves],
+            hovertemplate="<b>%{hovertext}</b>"
+                          + (" — click to drill down" if _has_click else "")
+                          + "<extra></extra>",
+            showlegend=False,
+        ))
+
+    # Pillar nodes
+    p_border_colors = ["#facc15" if p[0] == expanded else "white" for p in pillars]
+    p_border_widths = [3 if p[0] == expanded else 2 for p in pillars]
+    fig.add_trace(go.Scatter(
+        x=[p[3] for p in pillars], y=[PILLAR_Y] * 4,
+        mode="markers+text",
+        marker=dict(size=58, color=[_color(p[4]) for p in pillars],
+                    line=dict(color=p_border_colors, width=p_border_widths)),
+        text=[p[1] for p in pillars],
+        textfont=dict(size=8, color="white"),
+        textposition="middle center",
+        customdata=[p[0] for p in pillars],   # IDs: "rev","ord","qual","geo"
+        hovertemplate="%{text}  — click to expand<extra></extra>",
+        showlegend=False,
     ))
+
+    # Root node
+    fig.add_trace(go.Scatter(
+        x=[ROOT_X], y=[ROOT_Y],
+        mode="markers+text",
+        marker=dict(size=68, color=["#1e40af"], line=dict(color="white", width=2)),
+        text=["E-Commerce"],
+        textfont=dict(size=9, color="white"),
+        textposition="middle center",
+        customdata=["root"],
+        hovertemplate=f"Revenue: ${kpis['total_revenue']:,.0f}<extra></extra>",
+        showlegend=False,
+    ))
+
+    hint = "Click root to collapse ↑" if expanded else "Click a pillar to expand ↓"
     fig.update_layout(
-        margin=dict(l=0, r=0, t=0, b=0),
+        margin=dict(l=2, r=2, t=20, b=2),
         paper_bgcolor="rgba(0,0,0,0)",
-        height=260,
+        plot_bgcolor="rgba(0,0,0,0)",
+        height=320,
+        xaxis=dict(visible=False, range=[-0.06, 1.06]),
+        yaxis=dict(visible=False, range=[0.0, 1.0]),
+        hovermode="closest",
         font=dict(size=9),
+        title=dict(text=hint, font=dict(size=9, color="#6b7280"), x=0.5, y=0.995, xanchor="center"),
     )
     return fig
