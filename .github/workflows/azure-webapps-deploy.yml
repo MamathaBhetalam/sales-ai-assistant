@@ -1,0 +1,48 @@
+# Deploy this Streamlit app to Azure App Service (Linux, Python).
+#
+# Prerequisites:
+# 1. Create Azure Web App: Python 3.11, Linux.
+# 2. In Configuration → Application settings, add:
+#    - AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_DEPLOYMENT
+#    - Optional SMTP_* for email features
+# 3. Set Startup Command: bash startup.sh
+# 4. Download publish profile from Web App → Get publish profile (⋯).
+# 5. In GitHub repo → Settings → Secrets → Actions, add:
+#    AZURE_WEBAPP_PUBLISH_PROFILE = contents of the .PublishSettings file
+#
+# Then set AZURE_WEBAPP_NAME below to your app name and run the workflow.
+
+name: Deploy to Azure Web App
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AZURE_WEBAPP_NAME: sales-ai-assistant
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies (validate requirements)
+        run: pip install -r requirements.txt
+
+      - name: Deploy to Azure Web App
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ env.AZURE_WEBAPP_NAME }}
+          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
+          package: .
